@@ -1,0 +1,8 @@
+# Reproduce the checks the code is kept clean against:
+#   ruff check .
+#   radon cc -s -a rehapose.py analysis.py
+line-length = 100
+exclude = ["Body_Joint.py"]   # kept as a historical reference; not maintained
+
+[lint]
+select = ["E", "W", "F", "B", "C4", "SIM", "UP", "RET", "ARG"]

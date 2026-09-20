@@ -1,0 +1,6 @@
+# Python 3.11+ required. See README.md for why 3.10 does not work on recent macOS.
+# numpy and cv2 arrive with mediapipe (as opencv-contrib-python) - do NOT also list
+# opencv-python here, it installs a second, conflicting cv2.
+mediapipe==1.0.0   # 1.0.1 SIGABRTs on macOS arm64; <0.10.30 is the removed legacy API
+PyQt5>=5.15.0
+pyqtgraph>=0.13.7
