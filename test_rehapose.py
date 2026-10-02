@@ -1,15 +1,10 @@
-"""Smoke test: real MediaPipe landmarks through the real UI, no camera, no display.
-
-    QT_QPA_PLATFORM=offscreen python test_rehapose.py
-
-Covers the integration that actually breaks: Qt signal payloads, the QImage stride,
-pyqtgraph's nan line-breaks, and the results table.
-"""
+"""Headless UI smoke test: QT_QPA_PLATFORM=offscreen python test_rehapose.py"""
 import os
 import pathlib
 import shutil
 import sys
 import tempfile
+import time
 
 import cv2
 import numpy as np
@@ -46,14 +41,12 @@ def main():
     app.setOrganizationName("rehaPose")
     app.setApplicationName("rehaPoseTest")     # never touch the real preferences
     assert "rehaPoseTest" in rehapose.settings().fileName(), rehapose.settings().fileName()
-    # Modal dialogs block forever offscreen, so a regression that opens one would hang
-    # the run instead of failing it. Silence them before anything can open one.
+    # Modal dialogs block forever offscreen: stub them so a regression fails, not hangs.
     QtWidgets.QMessageBox.critical = staticmethod(lambda *_a, **_k: None)
     QtWidgets.QMessageBox.warning = staticmethod(lambda *_a, **_k: None)
     QtWidgets.QMessageBox.information = staticmethod(lambda *_a, **_k: None)
     QtWidgets.QFileDialog.getExistingDirectory = staticmethod(lambda *_a, **_k: "")
     QtWidgets.QFileDialog.getSaveFileName = staticmethod(lambda *_a, **_k: ("", ""))
-    # Point the data dir at a scratch folder so the first-run chooser stays silent.
     tmp = tempfile.mkdtemp(prefix="rehapose-test-")
     try:
         run(app, tmp)
@@ -67,18 +60,35 @@ def run(app, tmp):
     assert rehapose.session_dir() == pathlib.Path(tmp) / "sessions"
 
     window = rehapose.Main(camera=0)
-    # Nobody has entered an age or sex yet, so neither may default to a real value.
     assert window.age.value() == rehapose.AGE_UNSET, window.age.value()
     assert window.sex.currentText() == rehapose.SEX_UNSET, window.sex.currentText()
     window.exercise.setCurrentIndex(window.exercise.findData("knee_flexion"))
     window._snapshot()
 
-    # Set up session state the way start() does, without touching the camera.
     window.t0 = 0.0
     window.times = {j: [] for j in JOINTS}
     window.angles = {j: [] for j in JOINTS}
     window.filters = {j: analysis.OneEuro() for j in JOINTS}
 
+    frame, poses = track_sample()
+    detected = sum(1 for _, w in poses if w is not None)
+    assert detected > 0, "MediaPipe found no pose in the sample photo"
+
+    check_orientation(frame, poses)
+    check_setup_gate(window, app, frame, poses)
+    check_autosave(window)
+    check_chair_verdict(window)
+    check_chair_stand(window, app, frame, poses)
+
+    window.on_frame(frame.copy(), (None, None), 7.0)
+    assert window.angles["left_knee"][-1] is None
+
+    check_shell(window, tmp, frame, poses)
+    print(f"smoke test passed ({detected}/30 frames tracked)")
+
+
+def track_sample():
+    """The sample photo and 30 (pixel, world) landmark pairs from the lite model."""
     import mediapipe as mp
     from mediapipe.tasks import python as mpp
     from mediapipe.tasks.python import vision
@@ -100,17 +110,18 @@ def run(app, tmp):
         pixel = res.pose_landmarks[0] if res.pose_landmarks else None
         poses.append((pixel, world))
     landmarker.close()
-    detected = sum(1 for _, w in poses if w is not None)
-    assert detected > 0, "MediaPipe found no pose in the sample photo"
+    return frame, poses
 
-    # The real gate on real landmarks must produce a real cosine. Which way it decides on
-    # this one photo is not the point - analysis.demo() checks that against known yaws.
+
+def check_orientation(frame, poses):
+    import mediapipe as mp
+    from mediapipe.tasks import python as mpp
+    from mediapipe.tasks.python import vision
+
     pixel, world = poses[-1]
     cos = analysis.orientation_cos(pixel, world, frame.shape[1], frame.shape[0])
     assert cos is not None and 0.0 <= cos <= 1.0, cos
-    # Mirroring the photo turns the same body the other way; the gate must read nearly
-    # the same turn. On heavy, the default tier, shoulders alone moved 0.44 -> 0.81 for
-    # this photo; shoulders and hips averaged move 0.54 -> 0.65.
+    # The mirrored photo must read nearly the same turn on heavy (shoulders alone failed).
     turns = []
     for image_bgr in (frame, cv2.flip(frame, 1)):
         heavy = vision.PoseLandmarker.create_from_options(
@@ -126,18 +137,18 @@ def run(app, tmp):
                                               res.pose_world_landmarks[0],
                                               frame.shape[1], frame.shape[0]))
     assert abs(turns[0] - turns[1]) < 0.15, turns
-    # A refused setup must show the camera but record nothing.
+
+
+def check_setup_gate(window, app, frame, poses):
     rehapose.setup_check = lambda *_a, **_k: (False, "Turn side-on to the camera.")
     window.on_frame(frame.copy(), poses[0], 7.0)
     assert window.clock_start is None, "gate let a badly framed session start"
     assert all(not window.angles[j] for j in JOINTS), "gated frames were still recorded"
     assert window.video.pixmap() is not None, "gate should still show the camera"
 
-    # With the setup good, the same frames must record normally - once it has held for
-    # SETUP_HOLD frames, so a single lucky frame cannot start a session.
     good = lambda *_a, **_k: (True, "Setup looks good.")  # noqa: E731
     bad = lambda *_a, **_k: (False, "Turn side-on to the camera.")  # noqa: E731
-    # The hold is CONSECUTIVE: a bad frame in the middle starts the count again.
+    # The hold is CONSECUTIVE: a bad frame in the middle resets the count.
     for check in [good] * (rehapose.SETUP_HOLD - 1) + [bad] + [good] * (rehapose.SETUP_HOLD - 1):
         rehapose.setup_check = check
         window.on_frame(frame.copy(), poses[0], 7.0)
@@ -152,6 +163,8 @@ def run(app, tmp):
         assert len(window.angles[joint]) == 30, (joint, len(window.angles[joint]))
     assert len(window.stands) == 30
 
+
+def check_autosave(window):
     before = set(rehapose.session_dir().glob("*.csv"))
     window.show_results()
     assert window.stack.currentIndex() == 1
@@ -160,7 +173,6 @@ def run(app, tmp):
     assert window.export.isEnabled()
     assert "Saved" in window.status.text(), window.status.text()
 
-    # Every session must be written on stop, without anyone clicking Save.
     written = set(rehapose.session_dir().glob("*.csv")) - before
     assert len(written) == 1, written
     saved = written.pop()
@@ -169,7 +181,8 @@ def run(app, tmp):
     assert text.count("\n") > 30, "per-frame trace missing from the autosave"
     saved.unlink()
 
-    # Chair-stand mode: absolute thresholds, counted off whichever knee is more flexed.
+
+def check_chair_verdict(window):
     window.exercise.setCurrentIndex(window.exercise.findData("chair_stand_30s"))
     assert window.chair_mode
     window.stands = []
@@ -185,27 +198,23 @@ def run(app, tmp):
     line = window.verdict()
     assert "Chair stands: 7" in line and "14" in line, line
     assert "cannot check" in line, "protocol caveat missing from the result"
-    # Stopped by hand before 30 s: the count is not a score, so no norm beside it.
     window.time_called = False
     line = window.verdict()
     assert "not a 30-second score" in line and "14" not in line, line
     for extra in rehapose.session_dir().glob("*.csv"):
         extra.unlink()
 
-    check_chair_stand(window, app, frame, poses)
-
-    # A frame with no pose at all must not crash and must record a gap.
-    window.on_frame(frame.copy(), (None, None), 7.0)
-    assert window.angles["left_knee"][-1] is None
-
-    check_shell(window, tmp, frame, poses)
-    print(f"smoke test passed ({detected}/30 frames tracked)")
-
 
 def check_chair_stand(window, app, frame, poses):
     """Countdown, then measure, then time is called with the final-stand rule applied."""
-    import time
     kept = window.times, window.angles, window.stands
+    check_countdown(window, frame, poses)
+    check_time_called(window, app, frame)
+    check_stopped_early(window)
+    window.times, window.angles, window.stands = kept
+
+
+def check_countdown(window, frame, poses):
     window._snapshot()
     window.times = {j: [] for j in JOINTS}
     window.angles = {j: [] for j in JOINTS}
@@ -223,7 +232,8 @@ def check_chair_stand(window, app, frame, poses):
     window.on_frame(frame.copy(), poses[0], 7.0)
     assert window.measured and window.counted == 0
 
-    # Three full stands and a rise past halfway, then time is called.
+
+def check_time_called(window, app, frame):
     window.stands = []
     for _ in range(3):
         window.stands += list(np.linspace(90, 5, 12)) + list(np.linspace(5, 90, 12))
@@ -239,14 +249,14 @@ def check_chair_stand(window, app, frame, poses):
     head = storage.read_header(saved)
     assert head["stands"] == "4" and head["complete"] == "yes", head
 
-    # And History brings the stand count back, not just the joint table.
     window.show_history()
     window.open_stored(window.sessions.item(0, 0))
     assert "Chair stands: 4" in window.status.text(), window.status.text()
     for extra in rehapose.session_dir().glob("*.csv"):
         extra.unlink()
 
-    # Stopped by hand: the file, History and the stored view must all say so.
+
+def check_stopped_early(window):
     window.viewing_stored, window.time_called = None, False
     saved = window.autosave()
     assert storage.read_header(saved)["complete"] == "no"
@@ -255,7 +265,6 @@ def check_chair_stand(window, app, frame, poses):
     window.open_stored(window.sessions.item(0, 0))
     assert "stopped before 30 s" in window.status.text(), window.status.text()
     saved.unlink()
-    window.times, window.angles, window.stands = kept
 
 
 class FakeWorker:
@@ -275,14 +284,31 @@ real_session_dir = storage.session_dir
 
 def check_shell(window, tmp, frame, poses):
     """The app shell: state machine, menus, history round-trip, junk-session guard."""
-    # _sync is the only place widgets are enabled. Recording locks the exercise combo
-    # and History; idle unlocks them. The old code left the combo disabled forever
-    # after a camera error, because on_failed reset the button but not the combo.
+    check_sync(window)
+    check_stale_frame(window, frame, poses)
+    blocker = check_failed_save(window, tmp)
+    check_unsaved_guard(window, tmp, blocker)
+    check_still_stopping(window)
+    check_save_retry(window, tmp)
+    check_no_junk_session(window)
+    saved, head = check_exercise_keys(window)
+    stored = check_round_trip(window, saved)
+    check_half_write(window, saved)
+    check_twin_stops(window, saved)
+    check_padded_rows(saved, stored)
+    check_history(window, saved, head)
+    check_empty_history(window, saved)
+    check_person_reset(window)
+    check_legacy_migration(tmp)
+    check_missing_folder(window, tmp)
+    check_settings(window)
+
+
+def check_sync(window):
     window.worker = FakeWorker()
     window._sync()
     assert not window.exercise.isEnabled() and not window.act_history.isEnabled()
     assert window.button.text() == "Stop" and window.act_run.text() == "Stop"
-    # A camera that dies mid-session must keep what was already recorded.
     before = set(rehapose.session_dir().glob("*.csv"))
     window.on_failed("camera exploded")
     assert window.worker is None
@@ -292,7 +318,8 @@ def check_shell(window, tmp, frame, poses):
     assert len(kept) == 1, "camera failure threw the recording away"
     kept.pop().unlink()
 
-    # A frame still queued from a stopped worker must be dropped, not recorded.
+
+def check_stale_frame(window, frame, poses):
     class OldWorker(QtCore.QObject):
         ready = QtCore.pyqtSignal(object, object, float)
     old = OldWorker()
@@ -301,14 +328,18 @@ def check_shell(window, tmp, frame, poses):
     old.ready.emit(frame.copy(), poses[0], 7.0)
     assert len(window.angles["left_knee"]) == count, "stale frame was recorded"
 
-    # A save that fails on Stop must say so, not take the process down (exit 134).
+
+def check_failed_save(window, tmp):
     blocker = pathlib.Path(tmp) / "not-a-folder"
     blocker.write_text("")
     rehapose.settings().setValue("dataDir", str(blocker))
     window.show_results()
     assert "NOT SAVED" in window.status.text(), window.status.text()
     assert window.unsaved
-    # While unsaved, nothing may quietly replace the only copy on screen.
+    return blocker
+
+
+def check_unsaved_guard(window, tmp, blocker):
     box = QtWidgets.QMessageBox
     box.question = staticmethod(lambda *_a, **_k: box.Cancel)
     window.start()
@@ -319,14 +350,12 @@ def check_shell(window, tmp, frame, poses):
     # Save chosen, then the save dialog cancelled: still unsaved, still refused.
     box.question = staticmethod(lambda *_a, **_k: box.Save)
     assert not window.confirm_discard() and window.unsaved
-    # Save to a real path: allowed, and no longer unsaved.
     copy = pathlib.Path(tmp) / "copy.csv"
     dialog = QtWidgets.QFileDialog.getSaveFileName
     QtWidgets.QFileDialog.getSaveFileName = staticmethod(lambda *_a, **_k: (str(copy), ""))
     assert window.confirm_discard() and not window.unsaved and copy.exists()
     QtWidgets.QFileDialog.getSaveFileName = dialog
     copy.unlink()
-    # Discard: allowed, explicitly.
     window.unsaved = True
     box.question = staticmethod(lambda *_a, **_k: box.Discard)
     assert window.confirm_discard() and not window.unsaved
@@ -337,7 +366,9 @@ def check_shell(window, tmp, frame, poses):
     window.open_stored(QtWidgets.QTableWidgetItem())
     assert warned and "not saved" in warned[0], warned
     box.warning = staticmethod(lambda *_a, **_k: None)
-    # A stopped worker still unwinding (mid-download) must block a second one.
+
+
+def check_still_stopping(window):
     class StillRunning(QtCore.QObject):
         def isRunning(self):
             return True
@@ -345,7 +376,9 @@ def check_shell(window, tmp, frame, poses):
     window.start()
     assert window.worker is None and "Still stopping" in window.status.text()
     window.unsaved, window.retiring = True, None
-    # Once the folder is back, opening History retries the save by itself.
+
+
+def check_save_retry(window, tmp):
     rehapose.settings().setValue("dataDir", tmp)
     before = set(rehapose.session_dir().glob("*.csv"))
     window.show_history()
@@ -355,7 +388,8 @@ def check_shell(window, tmp, frame, poses):
     retried.pop().unlink()
     window.pages.setCurrentIndex(0)
 
-    # Stopping with nothing ever measured must not write an all-zeros session.
+
+def check_no_junk_session(window):
     recorded, window.times = window.times, {j: [] for j in JOINTS}
     window.summaries = {}
     window.worker = FakeWorker()
@@ -365,10 +399,10 @@ def check_shell(window, tmp, frame, poses):
     assert set(rehapose.session_dir().glob("*.csv")) == before, "junk session written"
     window.times = recorded
 
-    # Exercise keys, not display text, are what land in the file and drive History.
+
+def check_exercise_keys(window):
     window.exercise.setCurrentIndex(window.exercise.findData("knee_flexion"))
     window._snapshot()
-    # Changing the combo after Stop must not relabel what was recorded.
     window.exercise.setCurrentIndex(window.exercise.findData("heel_slides"))
     window.summaries = {j: analysis.summarize(window.angles[j]) for j in JOINTS}
     saved = window.autosave()
@@ -380,16 +414,20 @@ def check_shell(window, tmp, frame, poses):
     assert head["best_joint"] in JOINTS, head
     assert head["app_version"] == rehapose.VERSION and head["mediapipe"] == "1.0.0", head
     assert head["model"] == "heavy->lite", head     # the whole tier history, via _detach
+    return saved, head
 
-    # The file is the user's only copy: what it reads back must be what was shown.
+
+def check_round_trip(window, saved):
     stored = storage.stored_summaries(saved)
     assert set(stored) == set(JOINTS), stored.keys()
     for joint, live in window.summaries.items():
         for field in ("rom", "peak", "min", "coverage"):
             assert abs(stored[joint][field] - live[field]) <= 0.05, (joint, field)
         assert stored[joint]["reps"] == live["reps"], joint
+    return stored
 
-    # A write that dies halfway (full disk) must leave no truncated session behind.
+
+def check_half_write(window, saved):
     def half_write(part, *_a):
         pathlib.Path(part).write_text("exercise,knee_flexion\r\n")
         raise OSError(28, "No space left on device")
@@ -404,12 +442,14 @@ def check_shell(window, tmp, frame, poses):
         storage._write = real_write
     assert not doomed.exists() and not list(saved.parent.glob("*.part")), "truncated file"
 
-    # Two stops in the same second must give two files, not one overwritten.
+
+def check_twin_stops(window, saved):
     twin = window.autosave()
     assert twin != saved and twin.exists() and saved.exists(), (saved, twin)
     twin.unlink()
 
-    # Excel and Numbers pad blank rows with commas; the blocks must still split.
+
+def check_padded_rows(saved, stored):
     padded = saved.with_name("20200104-000000-knee_flexion.csv")
     raw = saved.read_bytes().replace(b"\r\n\r\n", b"\r\n,,,,,\r\n")
     assert raw.count(b"\r\n,,,,,\r\n") == 2, "test did not pad anything"
@@ -417,8 +457,8 @@ def check_shell(window, tmp, frame, poses):
     assert storage.stored_summaries(padded) == stored, "padded blank rows broke the reader"
     padded.unlink()
 
-    # A spreadsheet re-save in a legacy encoding, and a file that is not a session at
-    # all, must each cost one row - not the whole History page.
+
+def check_history(window, saved, head):
     mangled = saved.with_name("20200101-000000-knee_flexion.csv")
     mangled.write_bytes(saved.read_text(encoding="utf-8-sig").encode("cp1252"))
     junk = saved.with_name("20200102-000000-other.csv")
@@ -426,7 +466,6 @@ def check_shell(window, tmp, frame, poses):
     unopenable = saved.with_name("20200103-000000-dir.csv")
     unopenable.mkdir()                                 # open() raises IsADirectoryError
 
-    # History must read what autosave wrote, and round-trip it back into the results.
     window.show_history()
     assert window.pages.currentIndex() == 1
     assert window.sessions.rowCount() == 4, window.sessions.rowCount()
@@ -444,17 +483,18 @@ def check_shell(window, tmp, frame, poses):
     window.show_history()
     window.open_stored(window.sessions.item(0, 0))
     assert window.pages.currentIndex() == 0 and window.stack.currentIndex() == 1
-    # Viewing a stored session must not let Save a Copy write the live session over it.
     assert window.viewing_stored == saved
     assert not window.export.isEnabled() and not window.act_save.isEnabled()
 
-    # Empty state: zero sessions must say so rather than render a blank table.
+
+def check_empty_history(window, saved):
     saved.unlink()
     window.show_history()
     assert window.sessions.rowCount() == 0
     assert "No sessions yet" in window.caption.text()
 
-    # Age and sex follow the person code, so one patient's norm never lands on the next.
+
+def check_person_reset(window):
     window.person.setText("AB")
     window.on_person_changed()            # a new code asks for age and sex again...
     assert window.age.value() == rehapose.AGE_UNSET
@@ -482,7 +522,8 @@ def check_shell(window, tmp, frame, poses):
     assert window.age.value() == 72, "known person's age was not restored"
     assert window.sex.currentText() == "male", "known person's sex was not restored"
 
-    # Legacy sessions move across whole, leaving no half-copied file behind.
+
+def check_legacy_migration(tmp):
     legacy = pathlib.Path(tmp) / "legacy"
     legacy.mkdir()
     (legacy / "20250101-000000-free.csv").write_text("exercise,free\r\n")
@@ -491,7 +532,6 @@ def check_shell(window, tmp, frame, poses):
     assert storage.migrate_legacy(target) == 1
     assert [f.name for f in target.iterdir()] == ["20250101-000000-free.csv"]
     assert not list(legacy.iterdir()), "legacy original left behind"
-    # A copy that dies halfway must leave nothing under the real name, and no .part.
     (legacy / "20250102-000000-free.csv").write_text("exercise,free\r\n" * 100)
     def half_copy(src, dst):
         pathlib.Path(dst).write_bytes(pathlib.Path(src).read_bytes()[:10])
@@ -508,8 +548,8 @@ def check_shell(window, tmp, frame, poses):
     assert not list(target.glob("*.part")) and (legacy / "20250102-000000-free.csv").exists()
     storage.LEGACY_SESSIONS = real_legacy
 
-    # The sessions folder went missing and the picker was cancelled: keep the old
-    # folder rather than silently starting a second one in Documents.
+
+def check_missing_folder(window, tmp):
     missing = str(pathlib.Path(tmp) / "unplugged-drive")
     rehapose.settings().setValue("dataDir", missing)
     picker = QtWidgets.QFileDialog.getExistingDirectory
@@ -523,7 +563,8 @@ def check_shell(window, tmp, frame, poses):
         storage.session_dir = real_session_dir
         rehapose.settings().setValue("dataDir", tmp)
 
-    # Settings round-trip, so the app reopens the way it was left.
+
+def check_settings(window):
     window.age.setValue(81)
     window.cue.setChecked(False)
     window.save_settings()

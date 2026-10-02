@@ -1,8 +1,4 @@
-"""Joint angles, smoothing and post-session metrics.
-
-Pure numpy + stdlib: no Qt, no mediapipe, no camera. That is deliberate — it keeps
-`python analysis.py` runnable as a self-check on a box with no webcam and no display.
-"""
+"""Joint angles, smoothing and metrics; no Qt/camera/mediapipe: `python analysis.py` self-checks."""
 import math
 import numpy as np
 
@@ -18,12 +14,10 @@ JOINTS = {
     "right_shoulder": (24, 12, 14),
 }
 
-# Clinical convention: 0 deg = full extension for knee/elbow/hip, so flexion is the
-# supplement of the interior angle. Shoulder is already 0 deg with the arm at the side.
+# Clinical convention: 0 deg = full extension (supplement of interior), except shoulders.
 SUPPLEMENT = {j: not j.endswith("shoulder") for j in JOINTS}
 
-# Drawn skeleton (torso + limbs). mediapipe.solutions was removed in 1.0, so the
-# connection list lives here now.
+# Hardcoded: mediapipe 1.0 has no mp.solutions.
 CONNECTIONS = [
     (11, 12), (11, 23), (12, 24), (23, 24),
     (11, 13), (13, 15), (12, 14), (14, 16),
@@ -33,11 +27,7 @@ CONNECTIONS = [
 
 
 def flexion(landmarks, joint):
-    """Clinical flexion angle in degrees, from metric 3D world landmarks.
-
-    Must be fed pose_world_landmarks, not pose_landmarks: normalized coords divide x
-    by frame width and y by height independently, which shears every angle.
-    """
+    """Clinical flexion in degrees; feed pose_world_landmarks, never pose_landmarks."""
     ia, ib, ic = JOINTS[joint]
     a, b, c = (np.array([p.x, p.y, p.z]) for p in (landmarks[ia], landmarks[ib], landmarks[ic]))
     v1, v2 = a - b, c - b
@@ -53,12 +43,7 @@ def visible(landmarks, joint, threshold=0.5):
 
 
 class OneEuro:
-    """One Euro filter (Casiez et al. 2012).
-
-    Beats the old EWMA on the thing that matters here: it widens its own cutoff when the
-    limb is moving, so it kills jitter at rest without smearing the peak of a rep — and
-    a smeared peak is a wrong ROM number.
-    """
+    """One Euro filter (Casiez et al. 2012): kills jitter at rest without smearing rep peaks."""
 
     def __init__(self, mincutoff=1.0, beta=0.02, dcutoff=1.0):
         self.mincutoff, self.beta, self.dcutoff = mincutoff, beta, dcutoff
@@ -83,17 +68,7 @@ class OneEuro:
 
 
 class TierRatchet:
-    """Picks the pose-model tier by timing real inference, not by inspecting hardware.
-
-    Three rules, each there for a reason:
-      - only frames that actually found a person are timed, because MediaPipe
-        short-circuits on an empty frame and reads ~2.6x optimistic;
-      - the clock starts at the first detected pose, not at Start, so a user who walks
-        into frame still gets measured;
-      - it only steps down, and only inside the opening window, because switching models
-        mid-set shifts the measured angles and the rep counter would read that step as
-        real movement.
-    """
+    """Picks the model tier by timing frames with a person; only steps down, early."""
 
     def __init__(self, n_tiers, budget_ms=40.0, window_s=5.0, samples=30):
         self.n_tiers, self.budget, self.window, self.samples = n_tiers, budget_ms, window_s, samples
@@ -114,8 +89,7 @@ class TierRatchet:
             return None
         if len(self.probe) < self.samples:
             return None
-        median = float(np.median(self.probe[-self.samples:]))
-        if median <= self.budget or self.tier >= self.n_tiers - 1:
+        if self._fast_enough():
             self.locked = True
             return None
         self.tier += 1
@@ -123,34 +97,21 @@ class TierRatchet:
         self.started = now
         return self.tier
 
+    def _fast_enough(self):
+        """The recent median fits the budget, or there is no lighter tier left to try."""
+        median = float(np.median(self.probe[-self.samples:]))
+        return median <= self.budget or self.tier >= self.n_tiers - 1
+
 
 def rep_spans(angles, lo=None, hi=None, lo_frac=0.3, hi_frac=0.7, min_range=15.0):
-    """Index spans (start, end) of completed reps, into the ORIGINAL list.
-
-    Hysteresis: arm above `hi`, complete below `lo`. Two thresholds, not one, so jitter
-    around a single line cannot inflate the count. `start` tracks the true trough since
-    the last rep rather than the last sample below `lo`, so a span covers the whole
-    movement and its range is the real rep ROM.
-
-    Thresholds default to the joint's own observed range (self-calibrating: a knee bend
-    and a shoulder raise share nothing but going out and coming back). Pass absolute
-    lo/hi for a protocol test, where scoring a half-rep as a rep is the failure mode.
-
-    Indices refer to the ORIGINAL list including Nones, so they map back to frame times.
-    """
+    """Hysteresis rep spans (trough, end) into the ORIGINAL list; lo/hi for protocol tests."""
     vals = [(i, v) for i, v in enumerate(angles) if v is not None]
     if len(vals) < 3:
         return []
-    if lo is None or hi is None:
-        # 5th/95th percentile, not min/max: a single glitched frame would otherwise drag
-        # the arm-threshold above anything the movement actually reaches, and rep
-        # detection collapses to zero rather than merely reporting a wrong range.
-        seen = [v for _, v in vals]
-        lo_v, hi_v = (float(x) for x in np.percentile(seen, [5, 95]))
-        if hi_v - lo_v < min_range:  # noise, not movement
-            return []
-        lo = lo_v + lo_frac * (hi_v - lo_v) if lo is None else lo
-        hi = lo_v + hi_frac * (hi_v - lo_v) if hi is None else hi
+    thresholds = _thresholds(vals, lo, hi, lo_frac, hi_frac, min_range)
+    if thresholds is None:  # noise, not movement
+        return []
+    lo, hi = thresholds
 
     spans, armed = [], False
     start, trough = vals[0]
@@ -167,6 +128,20 @@ def rep_spans(angles, lo=None, hi=None, lo_frac=0.3, hi_frac=0.7, min_range=15.0
     return spans
 
 
+def _thresholds(vals, lo, hi, lo_frac, hi_frac, min_range):
+    """(lo, hi), filling whichever is None from the observed range; None if it is flat."""
+    if lo is not None and hi is not None:
+        return lo, hi
+    # Percentiles, not min/max: one glitched frame would push hi above every rep.
+    seen = [v for _, v in vals]
+    lo_v, hi_v = (float(x) for x in np.percentile(seen, [5, 95]))
+    if hi_v - lo_v < min_range:
+        return None
+    lo = lo_v + lo_frac * (hi_v - lo_v) if lo is None else lo
+    hi = lo_v + hi_frac * (hi_v - lo_v) if hi is None else hi
+    return lo, hi
+
+
 def count_reps(angles, **kwargs):
     return len(rep_spans(angles, **kwargs))
 
@@ -178,15 +153,8 @@ def summarize(angles, lo=None, hi=None):
         return {"rom": 0.0, "peak": 0.0, "min": 0.0, "reps": 0, "coverage": 0.0}
     a = np.asarray(seen, dtype=float)
     spans = rep_spans(angles, lo=lo, hi=hi)
-    # ROM is the MEDIAN of the per-rep ranges, not the session max-minus-min: a single
-    # glitched frame would otherwise permanently inflate the headline number a
-    # clinician reads. With no completed rep there is nothing to take a median of, so
-    # fall back to the session extent.
-    roms = []
-    for s, e in spans:
-        seg = [v for v in angles[s:e + 1] if v is not None]
-        if seg:
-            roms.append(max(seg) - min(seg))
+    # Median of per-rep ranges so one glitched frame cannot inflate ROM.
+    roms = _rep_roms(angles, spans)
     return {
         "rom": float(np.median(roms)) if roms else float(a.max() - a.min()),
         "peak": float(a.max()),
@@ -196,36 +164,25 @@ def summarize(angles, lo=None, hi=None):
     }
 
 
+def _rep_roms(angles, spans):
+    """Range of each span, over its detected frames only."""
+    segs = ([v for v in angles[s:e + 1] if v is not None] for s, e in spans)
+    return [max(seg) - min(seg) for seg in segs if seg]
+
+
 # --- Setup check -----------------------------------------------------------------
-# Camera placement is the largest controllable error source in single-camera pose, and
-# it is worth catching BEFORE a session rather than reporting as a coverage number
-# afterwards, on a session already wasted.
 
 def orientation_cos(pixel, world, frame_w, frame_h):
-    """How square-on the shoulders are: ~1.0 facing the camera, ~0.0 perfectly side-on.
-
-    Compares the shoulder-span:torso-height ratio as seen by the camera against the
-    same ratio in metric 3D, which supplies this individual's own anatomy - so it needs
-    no per-user calibration step.
-
-    The image ratio MUST be built from pixel coordinates. Normalized x and y are divided
-    by frame width and height separately, so using them raw makes this measure the
-    frame's aspect ratio rather than the body: verified 0.387 to 1.247 on one unchanged
-    pose, which is also impossible for a cosine.
-    """
+    """~1.0 facing the camera, ~0.0 side-on; MUST use pixel coords, not normalized."""
     torso_px = abs((pixel[11].y + pixel[12].y) / 2 - (pixel[23].y + pixel[24].y) / 2) * frame_h
     torso_m = abs((world[11].y + world[12].y) / 2 - (world[23].y + world[24].y) / 2)
     if torso_px < 1e-6 or torso_m < 1e-9:
         return None
     ratios = []
-    # Shoulders AND hips, averaged: each pair's 3D width leans on MediaPipe's noisiest
-    # axis (z), and on one mirrored photo the shoulder ratio alone moved 0.44 -> 0.81
-    # while the mean moved 0.54 -> 0.65.
+    # Average shoulders and hips: each 3D width leans on noisy z.
     for a, b in ((11, 12), (23, 24)):
         span_px = abs(pixel[a].x - pixel[b].x) * frame_w
-        # The TRUE 3D width, not its x component. World landmarks are camera-aligned,
-        # so world x shrinks with yaw exactly as the image does and the ratio
-        # cancelled the very turn it exists to measure: ~1.0 at every yaw.
+        # True 3D width, not world x: world x shrinks with yaw and cancels the turn.
         span_m = math.dist((world[a].x, world[a].y, world[a].z),
                            (world[b].x, world[b].y, world[b].z))
         if span_m > 1e-9:
@@ -234,19 +191,12 @@ def orientation_cos(pixel, world, frame_w, frame_h):
 
 
 def setup_check(pixel, world, frame_w, frame_h, view="side", margin=0.02):
-    """(ok, message) - is the camera placed well enough to start?
-
-    A warning, not a lock: a clinician may deliberately shoot frontal for a valgus view.
-    """
+    """(ok, message) on camera placement; a warning, not a lock."""
     if pixel is None or world is None:
         return False, "No person detected - step into frame."
-    needed = [0, 11, 12, 23, 24, 25, 26, 27, 28]
-    if any(pixel[i].visibility < 0.5 for i in needed):
-        return False, "Whole body not visible - step back so head and feet are in frame."
-    xs = [pixel[i].x for i in needed]
-    ys = [pixel[i].y for i in needed]
-    if min(xs) < margin or max(xs) > 1 - margin or min(ys) < margin or max(ys) > 1 - margin:
-        return False, "Body is touching the edge of frame - step back or re-aim."
+    problem = _framing_problem(pixel, margin)
+    if problem:
+        return False, problem
     cos = orientation_cos(pixel, world, frame_w, frame_h)
     if cos is None:
         return False, "Cannot read your orientation - step back into full view."
@@ -257,11 +207,19 @@ def setup_check(pixel, world, frame_w, frame_h, view="side", margin=0.02):
     return True, "Setup looks good."
 
 
-# --- Exercise vocabulary ---------------------------------------------------------
-# (key, display, scored). The KEY is written into every session file and is what
-# History groups by, so THE KEYS ARE FROZEN FOREVER - renaming one orphans every
-# session already recorded under it, with no migration short of rewriting every file
-# on disk. Display text can be reworded freely. Add to the end; never reuse a key.
+def _framing_problem(pixel, margin):
+    """Message if the head-to-feet landmarks are hidden or touch the frame edge, else None."""
+    needed = [0, 11, 12, 23, 24, 25, 26, 27, 28]
+    if any(pixel[i].visibility < 0.5 for i in needed):
+        return "Whole body not visible - step back so head and feet are in frame."
+    xs = [pixel[i].x for i in needed]
+    ys = [pixel[i].y for i in needed]
+    if min(xs) < margin or max(xs) > 1 - margin or min(ys) < margin or max(ys) > 1 - margin:
+        return "Body is touching the edge of frame - step back or re-aim."
+    return None
+
+
+# (key, display, scored). KEYS ARE FROZEN (written to every file): append, never rename.
 EXERCISES = (
     ("chair_stand_30s",    "30-second chair stand", True),
     ("knee_flexion",       "Knee flexion / extension", False),
@@ -275,20 +233,14 @@ EXERCISE_DISPLAY = {key: display for key, display, _ in EXERCISES}
 
 
 # --- 30-Second Chair Stand -------------------------------------------------------
-# Scored in COUNTS, which is why it survives on a single camera: the movement is a large
-# sagittal knee excursion, the best-conditioned thing MediaPipe measures, and the score
-# only needs to know that a threshold was crossed, not where the joint was.
 
 CHAIR_STAND_SECONDS = 30.0
 CHAIR_STAND_LO = 20.0   # knee flexion below this = standing
 CHAIR_STAND_HI = 70.0   # knee flexion above this = seated
-# "More than halfway up" for the final stand. Hip height over the seat is ~thigh*cos(knee
-# flexion) with the shank near vertical, so halfway is ~60 deg, not the 45 deg midpoint
-# of the two thresholds - 45 is ~70% of the rise and under-counts the protocol.
+# Halfway up is ~60 deg (hip height ~ thigh*cos(knee)), not the 45 deg midpoint.
 CHAIR_STAND_HALF = 60.0
 
-# Rikli & Jones criterion for maintaining physical independence, via SRALab.
-# (age_low, age_high): (women, men)
+# Rikli & Jones independence criterion (via SRALab): (age_low, age_high): (women, men).
 CHAIR_STAND_NORMS = {
     (60, 64): (15, 17), (65, 69): (15, 16), (70, 74): (14, 15), (75, 79): (13, 14),
     (80, 84): (12, 13), (85, 89): (11, 11), (90, 94): (9, 9),
@@ -296,12 +248,7 @@ CHAIR_STAND_NORMS = {
 
 
 def chair_stand_score(knee, lo=CHAIR_STAND_LO, hi=CHAIR_STAND_HI):
-    """(stands, final_counted) when time is called.
-
-    The published protocol counts a final stand if the participant is more than halfway
-    up at 30 s. Without that rule the count sits one below the protocol the norms were
-    built on, for anyone caught mid-rise. See CHAIR_STAND_HALF for where halfway is.
-    """
+    """(stands, final_counted); per protocol a final stand counts if past halfway up at 30 s."""
     spans = rep_spans(knee, lo=lo, hi=hi)
     tail = [v for v in knee[spans[-1][1] if spans else 0:] if v is not None]
     final = bool(tail) and max(tail) >= hi and tail[-1] <= CHAIR_STAND_HALF
@@ -318,89 +265,101 @@ def chair_stand_norm(age, sex):
     return None
 
 
-def demo():
-    """Self-check: python analysis.py"""
+# --- Self-check ------------------------------------------------------------------
 
-    class P:
-        def __init__(self, x, y, z, v=1.0):
-            self.x, self.y, self.z, self.visibility = x, y, z, v
+class _P:
+    def __init__(self, x, y, z, v=1.0):
+        self.x, self.y, self.z, self.visibility = x, y, z, v
 
-    # Straight leg: hip (0,0,0) - knee (0,1,0) - ankle (0,2,0) => 0 deg flexion.
-    lm = {23: P(0, 0, 0), 25: P(0, 1, 0), 27: P(0, 2, 0)}
-    lm = [lm.get(i, P(0, 0, 0)) for i in range(33)]
+
+def _cycles(n, a, b, steps):
+    """n round trips a -> b -> a, `steps` samples each way."""
+    out = []
+    for _ in range(n):
+        out += list(np.linspace(a, b, steps)) + list(np.linspace(b, a, steps))
+    return out
+
+
+def _body(yaw, w=1280, h=720, px_per_m=300.0):
+    """(pixel, world) landmarks of a standing body turned by `yaw` degrees."""
+    c, s_ = math.cos(math.radians(yaw)), math.sin(math.radians(yaw))
+    joints = {0: (0, -0.75), 11: (0.2, -0.5), 12: (-0.2, -0.5), 23: (0.1, 0.0),
+              24: (-0.1, 0.0), 25: (0.1, 0.45), 26: (-0.1, 0.45), 27: (0.1, 0.9),
+              28: (-0.1, 0.9)}
+    world, pixel = [_P(0, 0, 0)] * 33, [_P(0.5, 0.5, 0)] * 33
+    for i, (x, y) in joints.items():
+        world[i] = _P(x * c, y, -x * s_)          # yaw about the vertical axis
+        pixel[i] = _P((w / 2 + px_per_m * x * c) / w, (h / 2 + px_per_m * y) / h, 0)
+    return pixel, world
+
+
+def _check_angles():
+    lm = {23: _P(0, 0, 0), 25: _P(0, 1, 0), 27: _P(0, 2, 0)}
+    lm = [lm.get(i, _P(0, 0, 0)) for i in range(33)]
     assert abs(flexion(lm, "left_knee") - 0.0) < 1e-6, flexion(lm, "left_knee")
 
-    # Right angle at the knee => 90 deg flexion.
-    lm[27] = P(1, 1, 0)
+    lm[27] = _P(1, 1, 0)
     assert abs(flexion(lm, "left_knee") - 90.0) < 1e-6, flexion(lm, "left_knee")
 
-    # Shoulder is NOT supplemented: arm at side => ~0 deg.
-    lm[23], lm[11], lm[13] = P(0, 1, 0), P(0, 0, 0), P(0, 1, 0)
+    # Shoulder is NOT supplemented.
+    lm[23], lm[11], lm[13] = _P(0, 1, 0), _P(0, 0, 0), _P(0, 1, 0)
     assert abs(flexion(lm, "left_shoulder") - 0.0) < 1e-6, flexion(lm, "left_shoulder")
 
-    # visibility gate
     lm[25].visibility = 0.1
     assert not visible(lm, "left_knee")
 
-    # Three clean reps of a 0->90 bend.
-    wave = []
-    for _ in range(3):
-        wave += list(np.linspace(0, 90, 20)) + list(np.linspace(90, 0, 20))
+
+def _check_reps(wave):
     assert count_reps(wave) == 3, count_reps(wave)
 
-    # Noise around a fixed angle is not a rep.
     assert count_reps(list(45 + np.random.RandomState(0).randn(200) * 0.5)) == 0
 
-    # A signal that goes up but never comes back is not a completed rep.
     assert count_reps(list(np.linspace(0, 90, 50))) == 0
 
+
+def _check_summary(wave):
     s = summarize(wave + [None] * 20)
     assert abs(s["rom"] - 90.0) < 1e-6 and s["reps"] == 3
     assert abs(s["coverage"] - 100 * 120 / 140) < 1e-6, s["coverage"]
 
-    # ROM must survive a single glitched frame. Session max-minus-min would report the
-    # glitch; median-of-reps reports the movement.
+    # ROM must survive a single glitched frame.
     glitched = list(wave)
     glitched[37] = 148.0
     assert abs(summarize(glitched)["rom"] - 90.0) < 1e-6, summarize(glitched)["rom"]
-    assert max(glitched) - min(glitched) > 140.0   # the naive number really is that bad
+    assert max(glitched) - min(glitched) > 140.0
 
-    # Spans index into the ORIGINAL list, gaps included, so they map back to frame times.
+
+def _check_spans(wave):
     gappy = [None] * 5 + wave
     spans = rep_spans(gappy)
     assert len(spans) == 3 and spans[0][0] >= 5, spans
     assert all(gappy[s] is not None and gappy[e] is not None for s, e in spans)
 
-    # A span must cover the whole movement, so its range is the real rep ROM.
     s0, e0 = rep_spans(wave)[0]
     seg = [v for v in wave[s0:e0 + 1] if v is not None]
     assert abs((max(seg) - min(seg)) - 90.0) < 1e-6
 
-    # Absolute thresholds: full stands count, half stands do not. This is the whole
-    # reason the chair-stand test cannot use the self-calibrating default -- a frail
-    # patient doing ten 25-degree half-stands would otherwise score a perfect ten.
-    full = []
-    half = []
-    for _ in range(10):
-        full += list(np.linspace(90, 5, 15)) + list(np.linspace(5, 90, 15))
-        half += list(np.linspace(90, 65, 15)) + list(np.linspace(65, 90, 15))
+
+def _check_chair_stand():
+    # Absolute thresholds: the self-calibrating default scores half-stands as full ones.
+    full = _cycles(10, 90, 5, 15)
+    half = _cycles(10, 90, 65, 15)
     assert count_reps(full, lo=CHAIR_STAND_LO, hi=CHAIR_STAND_HI) == 10
     assert count_reps(half, lo=CHAIR_STAND_LO, hi=CHAIR_STAND_HI) == 0
-    # ...and the self-calibrating default is exactly what gets it wrong:
     assert count_reps(half) == 10
 
-    # Final-stand rule: more than halfway up at 30 s counts, less does not, and a
-    # participant already standing when time is called gets nothing extra.
     three = full[:90]                                      # 3 stands, ends seated at 90
     assert chair_stand_score(three) == (3, False)
     assert chair_stand_score(three + list(np.linspace(90, 40, 8))) == (4, True)
-    assert chair_stand_score(three + list(np.linspace(90, 55, 8))) == (4, True)  # 55 deg
+    assert chair_stand_score(three + list(np.linspace(90, 55, 8))) == (4, True)
     assert chair_stand_score(three + list(np.linspace(90, 65, 8))) == (3, False)
     assert chair_stand_score(three + list(np.linspace(90, 5, 15))) == (4, False)
-    assert chair_stand_score(list(np.linspace(90, 40, 8))) == (1, True)  # first rise
+    assert chair_stand_score(list(np.linspace(90, 40, 8))) == (1, True)
     assert chair_stand_score([None, None]) == (0, False)
 
-    # Keys are written into every session file, so they are frozen: append, never edit.
+
+def _check_exercises_and_norms():
+    # Keys are frozen: append, never edit.
     assert [k for k, _, _ in EXERCISES][:7] == [
         "chair_stand_30s", "knee_flexion", "hip_abduction", "shoulder_abduction",
         "shoulder_flexion", "heel_slides", "other"]
@@ -412,30 +371,30 @@ def demo():
     assert chair_stand_norm(None, "female") is None
     assert chair_stand_norm(72, None) is None       # unknown sex is not "male"
 
-    # Ratchet: a fast machine locks on tier 0 and never steps down.
+
+def _check_ratchet():
     r = TierRatchet(2, budget_ms=40.0)
     for i in range(60):
         assert r.update(10.0, i / 30.0, True) is None
     assert r.tier == 0 and r.locked
 
-    # A slow machine steps down once, then locks at the last tier.
     r = TierRatchet(2, budget_ms=40.0)
     changed = [r.update(90.0, i / 30.0, True) for i in range(70)]
     assert 1 in changed, changed[:40]
     assert r.tier == 1
 
-    # Undetected frames must not be timed, or an empty room picks the wrong tier.
+    # Undetected frames must not be timed.
     r = TierRatchet(2, budget_ms=40.0)
     for i in range(100):
         assert r.update(90.0, i / 30.0, False) is None
     assert r.tier == 0 and not r.locked and r.started is None
 
-    # The window closes on wall-clock time even if frames keep arriving.
     r = TierRatchet(2, budget_ms=40.0, window_s=1.0)
     r.update(90.0, 0.0, True)
     assert r.update(90.0, 1.5, True) is None and r.locked
 
-    # One Euro must converge to a constant and not overshoot a ramp.
+
+def _check_filter():
     f = OneEuro()
     for i in range(200):
         out = f(50.0, i / 30.0)
@@ -444,40 +403,45 @@ def demo():
     outs = [f(v, i / 30.0) for i, v in enumerate(np.linspace(0, 90, 60))]
     assert max(outs) <= 90.0 + 1e-6 and outs[-1] > 80.0, (max(outs), outs[-1])
 
-    # Orientation: a body turned by `yaw` must read |cos(yaw)|, whatever the frame shape.
-    def body(yaw, w=1280, h=720, px_per_m=300.0):
-        c, s_ = math.cos(math.radians(yaw)), math.sin(math.radians(yaw))
-        joints = {0: (0, -0.75), 11: (0.2, -0.5), 12: (-0.2, -0.5), 23: (0.1, 0.0),
-                  24: (-0.1, 0.0), 25: (0.1, 0.45), 26: (-0.1, 0.45), 27: (0.1, 0.9),
-                  28: (-0.1, 0.9)}
-        world, pixel = [P(0, 0, 0)] * 33, [P(0.5, 0.5, 0)] * 33
-        for i, (x, y) in joints.items():
-            world[i] = P(x * c, y, -x * s_)          # yaw about the vertical axis
-            pixel[i] = P((w / 2 + px_per_m * x * c) / w, (h / 2 + px_per_m * y) / h, 0)
-        return pixel, world
 
+def _check_orientation():
     for yaw in (0, 30, 60, 85):
-        pixel, world = body(yaw)
+        pixel, world = _body(yaw)
         got = orientation_cos(pixel, world, 1280, 720)
         assert abs(got - abs(math.cos(math.radians(yaw)))) < 1e-6, (yaw, got)
-    # Same pose, different frame shape: the cosine must not change.
-    pixel_w, world_w = body(60, 1280, 720)
-    pixel_s, world_s = body(60, 720, 720)
+    # Frame shape must not change the cosine.
+    pixel_w, world_w = _body(60, 1280, 720)
+    pixel_s, world_s = _body(60, 720, 720)
     assert abs(orientation_cos(pixel_w, world_w, 1280, 720)
                - orientation_cos(pixel_s, world_s, 720, 720)) < 1e-6
 
-    # Every branch of the setup check, from synthetic poses.
+
+def _check_setup():
     assert setup_check(None, None, 1280, 720)[0] is False
-    assert setup_check(*body(80), 1280, 720) == (True, "Setup looks good.")
-    ok, hint = setup_check(*body(0), 1280, 720)
+    assert setup_check(*_body(80), 1280, 720) == (True, "Setup looks good.")
+    ok, hint = setup_check(*_body(0), 1280, 720)
     assert not ok and "side-on" in hint, hint
-    assert setup_check(*body(0), 1280, 720, view="front")[0]
-    pixel, world = body(80)
-    pixel[27] = P(pixel[27].x, pixel[27].y, 0, v=0.1)
+    assert setup_check(*_body(0), 1280, 720, view="front")[0]
+    pixel, world = _body(80)
+    pixel[27] = _P(pixel[27].x, pixel[27].y, 0, v=0.1)
     assert "Whole body" in setup_check(pixel, world, 1280, 720)[1]
-    pixel, world = body(80, px_per_m=420.0)               # feet run off the bottom
+    pixel, world = _body(80, px_per_m=420.0)               # feet run off the bottom
     assert "edge" in setup_check(pixel, world, 1280, 720)[1]
 
+
+def demo():
+    """Self-check: python analysis.py"""
+    _check_angles()
+    wave = _cycles(3, 0, 90, 20)
+    _check_reps(wave)
+    _check_summary(wave)
+    _check_spans(wave)
+    _check_chair_stand()
+    _check_exercises_and_norms()
+    _check_ratchet()
+    _check_filter()
+    _check_orientation()
+    _check_setup()
     print("analysis.py self-check passed")
 
 

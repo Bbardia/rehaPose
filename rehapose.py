@@ -1,10 +1,4 @@
-"""rehaPose - live joint-angle biofeedback for rehab.
-
-One window: camera with skeleton overlay on the left, eight live joint graphs on the
-right, Start/Stop underneath, and a results table when you stop.
-
-    python rehapose.py [--camera N]
-"""
+"""rehaPose - live joint-angle biofeedback for rehab: python rehapose.py [--camera N]."""
 import argparse
 import contextlib
 import csv
@@ -28,11 +22,10 @@ from storage import (choose_data_dir, new_session_path, read_header, session_dir
                      settings, stamp_of, stored_summaries, write_session)
 
 VERSION = "0.2"
-MIN_COVERAGE = 80.0   # below this a row is not reported as a measurement
-AGE_UNSET = 17        # the age spinbox's "not entered" value, shown as "age ?"
+MIN_COVERAGE = 80.0  # below this a row is not reported
+AGE_UNSET = 17  # spinbox "not entered" value
 SEX_UNSET = "sex ?"
-SETUP_HOLD = 10       # consecutive good frames before the clock starts: one lucky frame
-                      # of z noise must not start a session on a bad camera position
+SETUP_HOLD = 10  # good frames before the clock, so one noisy frame cannot start it
 TIPS = ("Stand side-on to the camera, with your whole body in frame.\n\n"
         "Good light in front of you, not behind. Clothing that shows your\n"
         "knees and hips reads better than loose trousers.\n\n"
@@ -40,14 +33,13 @@ TIPS = ("Stand side-on to the camera, with your whole body in frame.\n\n"
 
 
 LIVE_WINDOW_S = 20.0
-COUNTDOWN_S = 3     # before a scored test, so its 30 s starts on a signal, not on framing
-# (Hz, ms). Distinct pitches so "go" and "time" are unmistakable without looking.
+COUNTDOWN_S = 3  # the 30 s starts on a signal, not on framing
+# (Hz, ms); distinct pitches so go and time are unmistakable.
 TONES = {"rep": (880, 90), "tick": (660, 120), "go": (1320, 350), "end": (440, 700)}
 
 
 def make_beep(path, freq=880.0, ms=90, rate=44100):
-    """Generate a cue as a .wav rather than shipping a binary asset. Cached by path, so
-    the filename must encode the tone."""
+    """Generate a cue .wav; cached by path, so the filename must encode the tone."""
     if path.exists():
         return path
     n = int(rate * ms / 1000)
@@ -64,8 +56,7 @@ def make_beep(path, freq=880.0, ms=90, rate=44100):
 
 
 def big_text(frame, text):
-    """Large outlined text in the top-left corner - drawn AFTER the mirror flip, or it
-    reads backwards."""
+    """Large outlined top-left text, drawn AFTER the mirror flip or it reads backwards."""
     h = frame.shape[0]
     scale, org = h / 160, (int(h * 0.04), int(h * 0.22))
     for color, width in (((0, 0, 0), 18), ((255, 255, 255), 6)):
@@ -90,6 +81,45 @@ def draw_overlay(frame, pixel, angles):
     return frame
 
 
+def history_result(head):
+    """History Result cell: stand count for a chair stand, else the best ROM."""
+    if not head.get("stands"):
+        best = head.get("best_rom", "-")
+        if head.get("best_joint"):
+            best = f"{head['best_joint'].replace('_', ' ')} {best}"
+        return best
+    early = " (stopped early)" if head.get("complete") == "no" else ""
+    return f"{head['stands']} stands{early}"
+
+
+def history_cells(path):
+    # One file mangled by a spreadsheet re-save must cost one row, not the page.
+    try:
+        head = read_header(path)
+    except (OSError, csv.Error):
+        head = {"exercise": "(unreadable)"}
+    key = head.get("exercise", head.get("mode", ""))
+    framing = head.get("framing_good_pct")
+    return [
+        stamp_of(path),
+        head.get("person") or "-",
+        EXERCISE_DISPLAY.get(key, key or "-"),
+        head.get("duration_s", "-"),
+        history_result(head),
+        framing + "%" if framing else "-",
+    ]
+
+
+def stored_reference(head):
+    """Reference sentence shown beside a stored chair-stand count."""
+    if head.get("complete") == "no":
+        return "No reference shown - the test was stopped before 30 s."
+    if not head.get("age") or not head.get("sex"):
+        return "Age or sex not entered, so no reference is shown."
+    return (f"Reference for an independent {head['sex']} aged {head['age']}: "
+            f"{head.get('reference') or 'none published for this age'}.")
+
+
 class Main(QtWidgets.QMainWindow):
     def __init__(self, camera):
         super().__init__()
@@ -100,24 +130,24 @@ class Main(QtWidgets.QMainWindow):
         self.times = {j: [] for j in JOINTS}
         self.angles = {j: [] for j in JOINTS}
         self.filters = {}
-        self.stands = []        # chair-stand signal: max(left knee, right knee) per frame
+        self.stands = []  # max(left knee, right knee) per frame
         self.stand_count = 0
-        self.clock_start = None  # measurement clock: starts when setup is good, not at Start
+        self.clock_start = None  # starts when setup is good, not at Start
         self.setup_ok = 0
         self.frames = 0
         self.summaries = {}
         self.viewing_stored = None
         self.model_tier = ""
-        self.unsaved = False     # the last session's autosave failed and no copy exists
-        self.retiring = None     # a stopped worker that outlived its 2 s wait
+        self.unsaved = False  # autosave failed and no copy exists
+        self.retiring = None  # a stopped worker that outlived its 2 s wait
         MODEL_DIR.mkdir(parents=True, exist_ok=True)
         self.sounds = {}
         for name, (freq, ms) in TONES.items():
             self.sounds[name] = QtMultimedia.QSoundEffect()
             self.sounds[name].setSource(QtCore.QUrl.fromLocalFile(str(
                 make_beep(MODEL_DIR / f"tone-{freq}-{ms}.wav", freq, ms))))
-        self.counted = None     # last countdown number shown, None outside a countdown
-        self.good_run = 0       # consecutive frames with a good setup
+        self.counted = None  # last countdown number shown
+        self.good_run = 0
         self.time_called = self.final_counted = False
         self.setWindowTitle("rehaPose")
         self.resize(1500, 820)
@@ -147,9 +177,7 @@ class Main(QtWidgets.QMainWindow):
                                "every session file.")
         self.person.setMaxLength(24)
         self.person.setFixedWidth(130)
-        # textEdited, not editingFinished: on macOS buttons and combos do not take focus on
-        # click, so editingFinished never fired before Start and then wiped the age and
-        # sex picked after typing the code. Fires on user edits only, not on setText().
+        # textEdited, not editingFinished: macOS buttons don't take focus, so it never fired.
         self.person.textEdited.connect(self.on_person_changed)
         self.last_person = ""
         self.age = QtWidgets.QSpinBox()
@@ -212,9 +240,7 @@ class Main(QtWidgets.QMainWindow):
                                             QtGui.QKeySequence.Save)
         file_menu.addAction("Show Sessions Folder", self.open_folder)
         file_menu.addSeparator()
-        # self.close(), NOT app.quit(): quit must go through closeEvent, or the worker
-        # is killed mid-frame and the session is never written. Quitting would become
-        # the one path in the app that loses data.
+        # self.close(), NOT app.quit(): quit skips closeEvent and loses the session.
         file_menu.addAction("Quit", self.close, QtGui.QKeySequence.Quit)
 
         session_menu = bar.addMenu("&Session")
@@ -255,14 +281,13 @@ class Main(QtWidgets.QMainWindow):
     def restore_settings(self):
         s = settings()
         geometry = s.value("geometry")
-        if geometry is not None:          # restoreGeometry(None) raises TypeError
+        if geometry is not None:  # restoreGeometry(None) raises TypeError
             self.restoreGeometry(geometry)
         key = s.value("exercise", "", type=str)
         index = self.exercise.findData(key)
         if index >= 0:
             self.exercise.setCurrentIndex(index)
-        # Unset unless someone entered it: a default of 70 got a real norm printed
-        # beside the count of a person whose age nobody had typed in.
+        # Unset by default, or a norm is printed for an age nobody typed in.
         self.age.setValue(s.value("age", AGE_UNSET, type=int))
         self.sex.setCurrentText(s.value("sex", SEX_UNSET, type=str))
         self.person.setText(s.value("person", "", type=str))
@@ -279,12 +304,7 @@ class Main(QtWidgets.QMainWindow):
         s.setValue("beep", self.cue.isChecked())
 
     def _sync(self):
-        """The single place a widget is enabled or retitled.
-
-        State is derived, not stored: `worker` means recording, `summaries` means there
-        are results to save. Scattering setEnabled calls through start/stop/on_failed is
-        what left the exercise combo disabled forever after a camera error.
-        """
+        """The single place a widget is enabled or retitled; state is derived, not stored."""
         recording = self.worker is not None
         reviewing = bool(self.summaries) and self.viewing_stored is None
         self.button.setText("Stop" if recording else "Start")
@@ -347,7 +367,7 @@ class Main(QtWidgets.QMainWindow):
         if target is None:
             return
         if self.unsaved:
-            # The folder is reachable again (that is how we got here): retry the save.
+            # The folder is reachable again: retry the save.
             with contextlib.suppress(OSError):
                 self.status.setText(f"Saved {self.autosave().name} (on retry)")
                 self.unsaved = False
@@ -355,26 +375,7 @@ class Main(QtWidgets.QMainWindow):
         self.sessions.setRowCount(len(rows))
         self.history_files = rows
         for row, path in enumerate(rows):
-            # One file mangled by a spreadsheet re-save must cost one row, not the page.
-            try:
-                head = read_header(path)
-            except (OSError, csv.Error):
-                head = {"exercise": "(unreadable)"}
-            key = head.get("exercise", head.get("mode", ""))
-            best = head.get("best_rom", "-")
-            if head.get("best_joint"):
-                best = f"{head['best_joint'].replace('_', ' ')} {best}"
-            cells = [
-                stamp_of(path),
-                head.get("person") or "-",
-                EXERCISE_DISPLAY.get(key, key or "-"),
-                head.get("duration_s", "-"),
-                head.get("stands", "") and f"{head['stands']} stands"
-                + (" (stopped early)" if head.get("complete") == "no" else "") or best,
-                head.get("framing_good_pct", "-") + "%"
-                if head.get("framing_good_pct") else "-",
-            ]
-            for col, text in enumerate(cells):
+            for col, text in enumerate(history_cells(path)):
                 self.sessions.setItem(row, col, QtWidgets.QTableWidgetItem(str(text)))
         if rows:
             self.caption.setText(
@@ -405,28 +406,18 @@ class Main(QtWidgets.QMainWindow):
                                           f"{path.name} has no per-joint numbers.")
             return
         self._fill_results(stored)
-        # Viewing a stored session must not enable Save a Copy: that button writes the
-        # LIVE session, which would land under the stored session's filename.
+        # Not while viewing a stored session: Save a Copy writes the LIVE session.
         self.viewing_stored = path
         self.stack.setCurrentIndex(1)
         self.pages.setCurrentIndex(0)
         line = f"Showing {path.name} (stored). Press Start for a new session."
         if head.get("stands"):
-            if head.get("complete") == "no":
-                reference = "No reference shown - the test was stopped before 30 s."
-            elif not head.get("age") or not head.get("sex"):
-                reference = "Age or sex not entered, so no reference is shown."
-            else:
-                reference = (f"Reference for an independent {head['sex']} aged "
-                             f"{head['age']}: "
-                             f"{head.get('reference') or 'none published for this age'}.")
-            line = f"Chair stands: {head['stands']}.  {reference}  {line}"
+            line = f"Chair stands: {head['stands']}.  {stored_reference(head)}  {line}"
         self.status.setText(line)
         self._sync()
 
     def on_person_changed(self):
-        """Age and sex belong to a person, not to the machine. Carried over silently,
-        they put the last patient's norm beside the next patient's count."""
+        """Age and sex belong to a person; carried over, they put one patient's norm on the next."""
         code = self.person.text().strip()
         if code == self.last_person:
             return
@@ -436,7 +427,7 @@ class Main(QtWidgets.QMainWindow):
             self.age.setValue(int(known[0]))
             self.sex.setCurrentText(str(known[1]))
         else:
-            self.age.setValue(AGE_UNSET)        # ask, rather than inherit
+            self.age.setValue(AGE_UNSET)  # ask, rather than inherit
             self.sex.setCurrentText(SEX_UNSET)
 
     def remember_person(self):
@@ -463,8 +454,7 @@ class Main(QtWidgets.QMainWindow):
         return any(self.times.values())
 
     def _snapshot(self):
-        """What is being recorded, frozen at Start. The widgets unlock again on Stop, so
-        reading them at save time filed a copy under whatever the combo said by then."""
+        """What is being recorded, frozen at Start, since the widgets unlock again on Stop."""
         age = self.age.value()
         self.recorded = {"exercise": self.exercise_key, "chair": self.chair_mode,
                          "person": self.person.text().strip(),
@@ -473,8 +463,7 @@ class Main(QtWidgets.QMainWindow):
                          else self.sex.currentText()}
 
     def confirm_discard(self):
-        """True if it is fine to drop the current session. Only asks when the autosave
-        failed, because then the results on screen are the only copy there is."""
+        """True if it is fine to drop the session; asks only when the autosave failed."""
         if not self.unsaved:
             return True
         box = QtWidgets.QMessageBox
@@ -489,16 +478,11 @@ class Main(QtWidgets.QMainWindow):
             return True
         return False
 
-    def start(self):
-        if not self.confirm_discard():
-            return
+    def _still_stopping(self):
         old = self.retiring
-        if old is not None and not sip.isdeleted(old) and old.isRunning():
-            # Two workers at once would both download into the same .part file.
-            self.status.setText("Still stopping the previous session - try again shortly.")
-            return
-        if choose_data_dir(self) is None:
-            return
+        return old is not None and not sip.isdeleted(old) and old.isRunning()
+
+    def _reset_session(self):
         self.times = {j: [] for j in JOINTS}
         self.angles = {j: [] for j in JOINTS}
         self.filters = {j: OneEuro() for j in JOINTS}
@@ -506,6 +490,17 @@ class Main(QtWidgets.QMainWindow):
         self.counted, self.time_called, self.final_counted = None, False, False
         self.clock_start, self.setup_ok, self.frames, self.good_run = None, 0, 0, 0
         self.summaries, self.viewing_stored = {}, None
+
+    def start(self):
+        if not self.confirm_discard():
+            return
+        if self._still_stopping():
+            # Two workers at once would both download into the same .part file.
+            self.status.setText("Still stopping the previous session - try again shortly.")
+            return
+        if choose_data_dir(self) is None:
+            return
+        self._reset_session()
         self._snapshot()
         self.remember_person()
         for joint, curve in self.curves.items():
@@ -522,9 +517,7 @@ class Main(QtWidgets.QMainWindow):
         self._sync()
 
     def _stale(self):
-        """True for a signal from a worker that has already been let go. One frame is
-        nearly always still queued when Stop is pressed; it used to land after the
-        autosave, overwrite the "Saved" line, and could even count a stand."""
+        """True for a signal from a worker that has already been let go."""
         sender = self.sender()
         return sender is not None and sender is not self.worker
 
@@ -533,15 +526,11 @@ class Main(QtWidgets.QMainWindow):
         if worker is not None:
             worker.stop()
             if not worker.wait(2000):
-                # Still inside a model download or load. Destroying a running QThread is
-                # a qFatal abort - whether Python's refcount does it now or the window's
-                # teardown does it at quit - so hand it to C++ with no parent: it is
-                # freed when it finishes, or simply never, if the app exits first.
+                # Destroying a running QThread is a qFatal abort: hand it to C++ with no parent.
                 sip.transferto(worker, None)
                 worker.finished.connect(worker.deleteLater)
                 self.retiring = worker
-            # "heavy->lite" if the ratchet stepped down: the tiers disagree by up to
-            # ~50 deg on one joint, so the file must not credit it all to one model.
+            # Record a heavy->lite step-down: the tiers disagree by up to ~50 deg on one joint.
             self.model_tier = "->".join(worker.tier_log)
 
     def stop(self):
@@ -549,8 +538,7 @@ class Main(QtWidgets.QMainWindow):
             return
         self._detach()
         if not self.measured:
-            # Nothing was ever measured. Writing this would put an all-zeros row at the
-            # top of History.
+            # Nothing was measured: an all-zeros row is not a session.
             self.video.setText(TIPS)
             self.status.setText(
                 "Stopped before the test started - nothing recorded."
@@ -572,7 +560,6 @@ class Main(QtWidgets.QMainWindow):
             return
         self._detach()
         if self.measured:
-            # A camera that drops out mid-set used to take the whole recording with it.
             self.show_results()
             message += "\n\nThe session up to that point was kept.\n" + self.status.text()
         else:
@@ -581,12 +568,7 @@ class Main(QtWidgets.QMainWindow):
         QtWidgets.QMessageBox.critical(self, "rehaPose", message)
 
     def gate(self, pixel, world, frame):
-        """(ok, hint). Starts the clock once setup has held for SETUP_HOLD frames.
-
-        The clock deliberately does not start at the button press: otherwise the 30 s
-        expires while the patient is still walking into frame, and a free session's
-        timeline begins before anything was measurable.
-        """
+        """(ok, hint). Starts the clock once setup has held for SETUP_HOLD frames, not at Start."""
         h, w = frame.shape[:2]
         ok, hint = setup_check(pixel, world, w, h)
         self.good_run = self.good_run + 1 if ok else 0
@@ -594,13 +576,15 @@ class Main(QtWidgets.QMainWindow):
             lead = COUNTDOWN_S if self.recorded["chair"] else 0
             self.clock_start = time.perf_counter() + lead
             self.t0 = self.clock_start
-        # Only frames from the recording itself count towards the framing figure. Frames
-        # spent walking into shot are not a measurement, and counting them diluted the
-        # percentage by however long the user took to get into position.
-        if self.clock_start is not None and time.perf_counter() >= self.clock_start:
+        # Only frames from the recording itself count towards framing, not walking into shot.
+        if self._clock_running():
             self.frames += 1
             self.setup_ok += ok
         return ok, hint
+
+    def _clock_running(self):
+        """Past setup and past the countdown: this frame is part of the recording."""
+        return self.clock_start is not None and time.perf_counter() >= self.clock_start
 
     def measure(self, pixel, world, now):
         current = {}
@@ -613,8 +597,7 @@ class Main(QtWidgets.QMainWindow):
             current[joint] = value
             self.times[joint].append(now)
             self.angles[joint].append(value)
-        # One leg occluded should not lose the set, so the chair-stand signal is
-        # whichever knee is more flexed.
+        # Whichever knee is more flexed, so one occluded leg does not lose the set.
         knees = [current[j] for j in ("left_knee", "right_knee") if current[j] is not None]
         self.stands.append(max(knees) if knees else None)
         return current
@@ -624,24 +607,16 @@ class Main(QtWidgets.QMainWindow):
             return
         pixel, world = landmarks
         ok, hint = self.gate(pixel, world, frame)
-        if self.clock_start is None or time.perf_counter() < self.clock_start:
+        if not self._clock_running():
             self.show_waiting(cv2.flip(frame, 1), hint)
             return
-        if self.counted:            # first measured frame after a countdown
+        if self.counted:  # first measured frame after a countdown
             self.counted = 0
             self.sounds["go"].play()
 
         now = time.perf_counter() - self.t0
         current = self.measure(pixel, world, now)
-
-        if pixel is not None:
-            frame = draw_overlay(frame, pixel, current)
-        # Mirror at display time only, so the overlay still lines up and the
-        # left/right labels stay anatomically correct.
-        shown = cv2.flip(frame, 1)
-        if self.recorded["chair"]:
-            big_text(shown, str(self.stand_count))
-        self.show_frame(shown)
+        self.show_live(frame, pixel, current)
         self.update_plots(now, current)
 
         note = "" if ok else f"   |   {hint}"
@@ -650,6 +625,15 @@ class Main(QtWidgets.QMainWindow):
         else:
             self.status.setText(f"{self.backend}  |  {dt:.0f} ms/frame  "
                                 f"({1000 / max(dt, 1e-6):.0f} fps){note}")
+
+    def show_live(self, frame, pixel, current):
+        if pixel is not None:
+            frame = draw_overlay(frame, pixel, current)
+        # Mirror at display time only, so overlay and left/right labels stay correct.
+        shown = cv2.flip(frame, 1)
+        if self.recorded["chair"]:
+            big_text(shown, str(self.stand_count))
+        self.show_frame(shown)
 
     def show_waiting(self, shown, hint):
         """Before the clock: setup hints, then a 3-2-1 with a tone per number."""
@@ -673,7 +657,7 @@ class Main(QtWidgets.QMainWindow):
                 self.sounds["rep"].play()
         left = CHAIR_STAND_SECONDS - now
         if left <= 0:
-            # Time is called: the protocol's final-stand rule applies now, and only now.
+            # Time is called: the final-stand rule applies now, and only now.
             self.stand_count, self.final_counted = chair_stand_score(self.stands)
             self.time_called = True
             self.sounds["end"].play()
@@ -708,8 +692,7 @@ class Main(QtWidgets.QMainWindow):
             self.unsaved = False
         except OSError as exc:
             self.unsaved = True
-            # A full disk or unplugged drive used to raise straight out of this slot -
-            # PyQt5's qFatal path, exit 134, and the session gone with the process.
+            # A failed write must not raise out of this slot: qFatal, exit 134, session lost.
             saved = (f"NOT SAVED ({exc.strerror or exc}) - use File > Save a Copy "
                      "before you start another session.")
         self.status.setText(f"{self.verdict()}  {saved}")
@@ -719,8 +702,7 @@ class Main(QtWidgets.QMainWindow):
         for row, joint in enumerate(JOINTS):
             s = summaries.get(joint, empty)
             thin = s["coverage"] < MIN_COVERAGE
-            # Below the coverage floor the numbers are not reported at all. A dash is
-            # honest; a number computed from a third of the frames is not.
+            # Below the coverage floor, a dash; a number from a third of the frames is not honest.
             cells = [joint.replace("_", " ")] + (
                 ["--", "--", "--", "--"] if thin else
                 [f"{s['rom']:.0f}°", f"{s['peak']:.0f}°", f"{s['min']:.0f}°", str(s["reps"])]
@@ -731,25 +713,34 @@ class Main(QtWidgets.QMainWindow):
                     item.setForeground(QtGui.QBrush(QtGui.QColor("#a06060")))
                 self.results.setItem(row, col, item)
 
-    def verdict(self):
-        total = max((t[-1] for t in self.times.values() if t), default=0.0)
-        framing = 100.0 * self.setup_ok / max(self.frames, 1)
+    def _duration(self):
+        return max((t[-1] for t in self.times.values() if t), default=0.0)
+
+    def _framing_pct(self):
+        return 100.0 * self.setup_ok / max(self.frames, 1)
+
+    def _chair_reference(self, total):
+        if not self.time_called:
+            # A stopped-early count is not comparable to a 30 s norm, so no norm is shown.
+            return f"Stopped at {total:.1f}s - not a 30-second score, so no reference is shown."
         rec = self.recorded
-        if rec["chair"]:
-            norm = chair_stand_norm(rec["age"], rec["sex"])
-            reference = (f"Reference for an independent {rec['sex']} aged "
-                         f"{rec['age']}: {norm}." if norm else
-                         "Age or sex not entered, so no reference is shown."
-                         if rec["age"] is None or rec["sex"] is None
-                         else "No published reference for this age.")
-            if not self.time_called:
-                # A count from a test stopped at 12 s is not comparable to a 30 s norm,
-                # so the norm is not printed beside it.
-                reference = (f"Stopped at {total:.1f}s - not a 30-second score, so no "
-                             "reference is shown.")
-            elif self.final_counted:
-                reference = ("Includes a final stand more than halfway up at 30 s, "
-                             "as the protocol counts it.  " + reference)
+        norm = chair_stand_norm(rec["age"], rec["sex"])
+        if norm:
+            reference = f"Reference for an independent {rec['sex']} aged {rec['age']}: {norm}."
+        elif rec["age"] is None or rec["sex"] is None:
+            reference = "Age or sex not entered, so no reference is shown."
+        else:
+            reference = "No published reference for this age."
+        if self.final_counted:
+            return ("Includes a final stand more than halfway up at 30 s, "
+                    "as the protocol counts it.  " + reference)
+        return reference
+
+    def verdict(self):
+        total = self._duration()
+        framing = self._framing_pct()
+        if self.recorded["chair"]:
+            reference = self._chair_reference(total)
             return (f"Chair stands: {self.stand_count}.  {reference}  "
                     f"Protocol: 43-45 cm chair against a wall, arms crossed at the chest, "
                     f"full stand each rep - the app cannot check this.  "
@@ -758,8 +749,7 @@ class Main(QtWidgets.QMainWindow):
                 f"Rows below {MIN_COVERAGE:.0f}% tracked are not reported.")
 
     def autosave(self):
-        """Every session is written on stop. Pressing Start again used to discard the
-        previous one silently, with the only copy behind a Save dialog nobody clicked."""
+        """Every session is written on stop, so Start never discards an unsaved one silently."""
         target = session_dir()
         if target is None:
             raise OSError("the sessions folder is not available")
@@ -772,30 +762,31 @@ class Main(QtWidgets.QMainWindow):
 
     def session_header(self):
         reported = {j: s for j, s in self.summaries.items() if s["coverage"] >= MIN_COVERAGE}
-        # Named, because the largest ROM of eight joints is often not the joint the
-        # exercise is about - on a knee session it can be the elbow, the noisiest one.
+        # Named, because the largest ROM is often not the exercise's joint (e.g. the elbow).
         best_joint = max(reported, key=lambda j: reported[j]["rom"], default="")
         best = reported[best_joint]["rom"] if best_joint else 0.0
-        duration = max((t[-1] for t in self.times.values() if t), default=0.0)
+        duration = self._duration()
         rec = self.recorded
         rows = [
-            # The KEY, never the display text: History shows this, and renaming a
-            # label must not orphan every session recorded before the rename.
+            # The KEY, never the display text: renaming a label must not orphan old sessions.
             ["exercise", rec["exercise"], "person", rec["person"]],
             ["duration_s", f"{duration:.0f}"],
-            # Provenance, so a later analysis can tell which model produced which angles.
+            # Provenance: which model produced which angles.
             ["app_version", VERSION, "model", self.model_tier],
             ["mediapipe", mediapipe_version()],
             ["best_rom", f"{best:.0f}°", "best_joint", best_joint],
         ]
         if rec["chair"]:
-            rows += [
-                ["stands", self.stand_count, "complete", "yes" if self.time_called else "no"],
-                ["age", "" if rec["age"] is None else rec["age"], "sex", rec["sex"] or ""],
-                ["reference", chair_stand_norm(rec["age"], rec["sex"])],
-            ]
-        framing = 100.0 * self.setup_ok / max(self.frames, 1)
-        return rows + [["framing_good_pct", f"{framing:.1f}"]]
+            rows += self._chair_rows()
+        return rows + [["framing_good_pct", f"{self._framing_pct():.1f}"]]
+
+    def _chair_rows(self):
+        rec = self.recorded
+        return [
+            ["stands", self.stand_count, "complete", "yes" if self.time_called else "no"],
+            ["age", "" if rec["age"] is None else rec["age"], "sex", rec["sex"] or ""],
+            ["reference", chair_stand_norm(rec["age"], rec["sex"])],
+        ]
 
     def save_csv(self):
         path, _ = QtWidgets.QFileDialog.getSaveFileName(
@@ -812,8 +803,7 @@ class Main(QtWidgets.QMainWindow):
         self.status.setText(f"Saved {path}")
 
     def closeEvent(self, event):
-        # Quitting mid-session used to write the CSV and vanish in the same tick, so the
-        # user never saw the results or learned a file existed. Ask, then show them.
+        # Ask before quitting mid-session, then show the results and the saved file.
         if self.worker is not None:
             answer = QtWidgets.QMessageBox.question(
                 self, "rehaPose", "A session is still recording.\n\n"

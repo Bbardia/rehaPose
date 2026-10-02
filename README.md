@@ -8,9 +8,11 @@ right, a results table when you stop.
 
 ## Install
 
-Needs **Python 3.11 or newer**, on an Apple Silicon Mac, Windows (x64 or arm64) or Linux
-(x64 or arm64). Intel Macs are not supported: `mediapipe==1.0.0` ships no wheel for them,
-and the version pin is not negotiable (see `requirements.txt`).
+Needs **Python 3.11 or newer**, on an Apple Silicon Mac, Windows x64 or Linux x64. Only
+macOS arm64 is tested. Intel Macs: no `mediapipe==1.0.0` wheel. Windows and Linux on ARM:
+no PyQt5 wheel, so pip tries to compile it from source. On Linux you may also need the Qt
+xcb libraries (`libxcb-*`, `libxkbcommon-x11-0`) and GStreamer for the beeps, and the
+user must be in the `video` group for the camera.
 
 ```bash
 python3.11 -m venv .venv

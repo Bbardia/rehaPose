@@ -1,10 +1,4 @@
-"""Where sessions live and how a session file is laid out.
-
-The user's only copy of every session goes through here, so this is the layer that must
-never lose data: folder choice and its failure modes, the one-time migration out of
-~/.cache, and reading files back after a spreadsheet has had its way with them.
-No camera, no mediapipe; QtCore for QSettings and QtWidgets only for the folder picker.
-"""
+"""Session storage: folder choice, ~/.cache migration, and the session CSV layout."""
 import csv
 import datetime
 import os
@@ -13,15 +7,13 @@ from pathlib import Path
 
 from PyQt5 import QtCore, QtWidgets
 
-# Sessions were once written under the model cache, which the OS may purge.
+# Pre-chooser location under the model cache, which the OS may purge.
 LEGACY_SESSIONS = Path.home() / ".cache" / "rehapose" / "sessions"
 JOINT_COLUMNS = ["joint", "rom_deg", "peak_deg", "min_deg", "reps", "tracked_pct"]
 
 
 def settings():
-    # No arguments: resolve from the QApplication's organization/application names.
-    # Hardcoding ("rehaPose", "rehaPose") here made the smoke test's "rehaPoseTest"
-    # name a no-op, so every test run pointed the REAL dataDir at a temp folder.
+    # No args: use the QApplication's names, so tests never touch the real dataDir.
     return QtCore.QSettings()
 
 
@@ -34,16 +26,12 @@ def session_dir():
     try:
         path.mkdir(parents=True, exist_ok=True)
     except OSError:
-        return None   # unplugged drive, revoked permission, or the folder became a file
+        return None   # unplugged drive, revoked permission, or path became a file
     return path
 
 
 def choose_data_dir(parent):
-    """First run: ask once where sessions should live, then remember it.
-
-    Asked rather than assumed because this is the user's only copy, and a folder they
-    cannot find is a folder they cannot back up or send to anyone.
-    """
+    """Ask once where sessions live (the user's only copy), then remember it."""
     existing = session_dir()
     if existing is not None:
         return existing
@@ -61,8 +49,7 @@ def choose_data_dir(parent):
     picked = QtWidgets.QFileDialog.getExistingDirectory(
         parent, "Keep sessions in", str(default.parent))
     if not picked and previous:
-        # Cancelled while the old folder is missing: keep pointing at it. Falling back to
-        # Documents here would silently split sessions across two folders for good.
+        # Keep the missing folder: falling back would split sessions across two folders.
         return None
     root = Path(picked) if picked else default
     try:
@@ -81,7 +68,7 @@ def choose_data_dir(parent):
 
 
 def migrate_legacy(target):
-    """Sessions used to be written under ~/.cache, which the OS may delete."""
+    """Move sessions out of ~/.cache, which the OS may delete."""
     if not LEGACY_SESSIONS.is_dir():
         return 0
     target.mkdir(parents=True, exist_ok=True)
@@ -90,9 +77,7 @@ def migrate_legacy(target):
         new = target / old.name
         if new.exists():
             continue
-        # Copy to a side name, then swap in atomically: rename() fails across volumes,
-        # and shutil.move() can leave a truncated file under the real name that the
-        # exists() check above would then skip forever.
+        # Copy then os.replace: rename() fails across volumes, move() can leave a stub.
         part = new.with_name(new.name + ".part")
         try:
             shutil.copy2(old, part)
@@ -114,13 +99,12 @@ def stamp_of(path):
 
 
 def is_blank(row):
-    # A spreadsheet re-save pads blank rows with commas out to the used width.
+    # Spreadsheet re-saves pad blank rows with commas.
     return not any(cell.strip() for cell in row)
 
 
 def read_header(path):
-    """Block 1 of a session file as a dict. Files are written with csv.writer, so they
-    must be read back with csv.reader on newline="" - the line endings are CRLF."""
+    """Block 1 of a session file as a dict; needs csv.reader on newline="" (CRLF)."""
     head = {}
     with open(path, newline="", encoding="utf-8-sig", errors="replace") as handle:
         for row in csv.reader(handle):
@@ -152,8 +136,7 @@ def read_joints(path):
 
 
 def stored_summaries(path):
-    """Block 2 in the shape summarize() returns, so one renderer serves live and stored.
-    Raises ValueError/KeyError on a file that has been edited out of shape."""
+    """Block 2 shaped like summarize(); raises ValueError/KeyError on a mangled file."""
     return {joint: {"rom": float(v["rom_deg"]), "peak": float(v["peak_deg"]),
                     "min": float(v["min_deg"]), "reps": int(v["reps"]),
                     "coverage": float(v["tracked_pct"])}
@@ -164,18 +147,16 @@ def new_session_path(target, key):
     """A fresh filename: timestamp first, so History sorts and stamp_of() parses it."""
     stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     path, n = target / f"{stamp}-{key}.csv", 2
-    while path.exists():           # two stops in one second must not overwrite
+    while path.exists():           # same-second stops must not overwrite
         path, n = target / f"{stamp}-{key}-{n}.csv", n + 1
     return path
 
 
 def write_session(path, header, summaries, times, angles):
-    """Three blocks separated by blank rows: header key/value rows (two pairs per row at
-    most, which is what read_header understands), per-joint summary, per-frame trace."""
+    """Header (max two pairs per row), per-joint summary, per-frame trace; blank-row separated."""
     joints = list(summaries)
     path = Path(path)
-    # Written to a side name and swapped in, so a full disk leaves no truncated session
-    # under a real name - History would list it, and every save retry would add another.
+    # Side name + swap: a full disk must not leave a truncated session History would list.
     part = path.with_name(path.name + ".part")
     try:
         _write(part, header, summaries, times, angles, joints)
@@ -185,7 +166,7 @@ def write_session(path, header, summaries, times, angles):
 
 
 def _write(part, header, summaries, times, angles, joints):
-    # utf-8-sig: the BOM is what makes Excel show the degree sign instead of mojibake.
+    # utf-8-sig: the BOM makes Excel show the degree sign.
     with open(part, "w", newline="", encoding="utf-8-sig") as handle:
         writer = csv.writer(handle)
         writer.writerows(header)

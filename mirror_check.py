@@ -1,17 +1,4 @@
-"""Mirror-consistency check on a recorded clip: how much does the pipeline disagree
-with itself?
-
-    python mirror_check.py clip.mp4 [--tier heavy|lite|both]
-
-Flipping an image swaps the person's anatomical left and right, so a perfect pipeline
-reports left_knee on the original equal to right_knee on the flipped copy. The gap is
-the pipeline's own inconsistency - a floor on its error, not the error. It cannot see a
-bias that is the same on both sides, and angles here are raw, before the One Euro filter.
-
-Each stream gets its own VIDEO-mode landmarker, because that is the mode the app runs in
-and VIDEO mode tracks across frames. Record the clip the way the app is used: side-on,
-whole body in frame, doing the exercise.
-"""
+"""Mirror-gap error floor: python mirror_check.py clip.mp4 [--tier heavy|lite|both]"""
 import argparse
 
 import cv2
@@ -36,6 +23,25 @@ def angles(result):
     return {j: flexion(world, j) for j in JOINTS if visible(pixel, j)}
 
 
+def mirrored_pair(mp, straight, mirrored, frame, stamp):
+    """Angles from one frame and from its mirror image, each through its own landmarker."""
+    pair = []
+    for model, image in ((straight, frame), (mirrored, cv2.flip(frame, 1))):
+        rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        pair.append(angles(model.detect_for_video(
+            mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb), stamp)))
+    return pair
+
+
+def pair_gaps(a, b):
+    """(family, abs gap) for each joint seen in `a` whose twin is seen in mirrored `b`."""
+    for joint in JOINTS:
+        side, family = joint.split("_", 1)
+        twin = ("right_" if side == "left" else "left_") + family
+        if a.get(joint) is not None and b.get(twin) is not None:
+            yield family, abs(a[joint] - b[twin])
+
+
 def mirror_gaps(path, tier):
     """{joint family: [abs gap per frame]} for one tier over the whole clip."""
     import mediapipe as mp
@@ -43,8 +49,7 @@ def mirror_gaps(path, tier):
     if not cap.isOpened():
         raise SystemExit(f"cannot open {path}")
     fps = cap.get(cv2.CAP_PROP_FPS)
-    # Broken or VFR metadata reports 0, NaN, or a timebase like 90000. VIDEO mode needs
-    # strictly increasing millisecond stamps, so anything above 1000 fps would repeat one.
+    # Bogus fps (0, NaN, 90000) would repeat ms stamps, which VIDEO mode rejects.
     fps = fps if 0 < fps <= 1000 else 30.0
     straight, mirrored = landmarker(tier), landmarker(tier)
     gaps = {j.split("_", 1)[1]: [] for j in JOINTS}
@@ -56,17 +61,9 @@ def mirror_gaps(path, tier):
                 break
             stamp = int(frames * 1000 / fps) + 1
             frames += 1
-            pair = []
-            for model, image in ((straight, frame), (mirrored, cv2.flip(frame, 1))):
-                rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-                pair.append(angles(model.detect_for_video(
-                    mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb), stamp)))
-            a, b = pair
-            for joint in JOINTS:
-                side, family = joint.split("_", 1)
-                twin = ("right_" if side == "left" else "left_") + family
-                if a.get(joint) is not None and b.get(twin) is not None:
-                    gaps[family].append(abs(a[joint] - b[twin]))
+            a, b = mirrored_pair(mp, straight, mirrored, frame, stamp)
+            for family, gap in pair_gaps(a, b):
+                gaps[family].append(gap)
     finally:
         cap.release()
         straight.close()
