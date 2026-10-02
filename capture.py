@@ -8,6 +8,7 @@ import base64
 import contextlib
 import hashlib
 import importlib.metadata
+import shutil
 import time
 import urllib.request
 from pathlib import Path
@@ -46,7 +47,10 @@ def ensure_model(tier):
     if not path.exists():
         url = MODEL_URL.format(t=tier)
         tmp = path.with_suffix(".part")
-        urllib.request.urlretrieve(url, tmp)
+        # A timeout, because a stalled read with none blocks the worker - and Start, which
+        # waits for a stopping worker - for as long as the network cares to take.
+        with urllib.request.urlopen(url, timeout=30) as response, open(tmp, "wb") as out:
+            shutil.copyfileobj(response, out)
         if md5_of(tmp) != MODEL_MD5[tier]:
             tmp.unlink()
             raise RuntimeError(f"The {tier} model download was corrupted - try Start again.")
@@ -110,8 +114,14 @@ class PoseWorker(QtCore.QThread):
         # Every tier up front, before the camera: a ratchet step-down must not stall the
         # frame loop on a download while the measuring clock keeps running.
         self.status.emit("Preparing models (the first run downloads about 36 MB)...")
-        models = {tier: ensure_model(tier) for tier in TIERS}
+        models = {}
+        for tier in TIERS:
+            if self._stop:          # Stop pressed mid-download: do not fetch the rest
+                return
+            models[tier] = ensure_model(tier)
 
+        if self._stop:
+            return
         cap = self._open_camera()
         if cap is None:
             return

@@ -21,7 +21,7 @@ import capture
 import rehapose
 import storage
 from analysis import JOINTS
-from PyQt5 import QtCore, QtWidgets
+from PyQt5 import QtCore, QtGui, QtWidgets
 
 
 # Pinned to a commit: "main" of an unmaintained repo can move or vanish under the test.
@@ -51,6 +51,8 @@ def main():
     QtWidgets.QMessageBox.critical = staticmethod(lambda *_a, **_k: None)
     QtWidgets.QMessageBox.warning = staticmethod(lambda *_a, **_k: None)
     QtWidgets.QMessageBox.information = staticmethod(lambda *_a, **_k: None)
+    QtWidgets.QFileDialog.getExistingDirectory = staticmethod(lambda *_a, **_k: "")
+    QtWidgets.QFileDialog.getSaveFileName = staticmethod(lambda *_a, **_k: ("", ""))
     # Point the data dir at a scratch folder so the first-run chooser stays silent.
     tmp = tempfile.mkdtemp(prefix="rehapose-test-")
     try:
@@ -133,10 +135,14 @@ def run(app, tmp):
 
     # With the setup good, the same frames must record normally - once it has held for
     # SETUP_HOLD frames, so a single lucky frame cannot start a session.
-    rehapose.setup_check = lambda *_a, **_k: (True, "Setup looks good.")
-    for _ in range(rehapose.SETUP_HOLD - 1):
+    good = lambda *_a, **_k: (True, "Setup looks good.")  # noqa: E731
+    bad = lambda *_a, **_k: (False, "Turn side-on to the camera.")  # noqa: E731
+    # The hold is CONSECUTIVE: a bad frame in the middle starts the count again.
+    for check in [good] * (rehapose.SETUP_HOLD - 1) + [bad] + [good] * (rehapose.SETUP_HOLD - 1):
+        rehapose.setup_check = check
         window.on_frame(frame.copy(), poses[0], 7.0)
     assert window.clock_start is None, "one good frame short of the hold, and it started"
+    rehapose.setup_check = good
     for i, landmark_pair in enumerate(poses):
         window.t0 = -(i / 30.0)  # advance the clock without sleeping
         window.on_frame(frame.copy(), landmark_pair, 7.0)
@@ -255,7 +261,7 @@ def check_chair_stand(window, app, frame, poses):
 class FakeWorker:
     """Stands in for PoseWorker so stop() can be exercised without a camera."""
 
-    tier_log = ["lite"]
+    tier_log = ["heavy", "lite"]
 
     def stop(self):
         pass
@@ -307,12 +313,38 @@ def check_shell(window, tmp, frame, poses):
     box.question = staticmethod(lambda *_a, **_k: box.Cancel)
     window.start()
     assert window.worker is None, "Start discarded an unsaved session"
+    closing = QtGui.QCloseEvent()
+    window.closeEvent(closing)
+    assert not closing.isAccepted(), "Quit discarded an unsaved session"
+    # Save chosen, then the save dialog cancelled: still unsaved, still refused.
+    box.question = staticmethod(lambda *_a, **_k: box.Save)
+    assert not window.confirm_discard() and window.unsaved
+    # Save to a real path: allowed, and no longer unsaved.
+    copy = pathlib.Path(tmp) / "copy.csv"
+    dialog = QtWidgets.QFileDialog.getSaveFileName
+    QtWidgets.QFileDialog.getSaveFileName = staticmethod(lambda *_a, **_k: (str(copy), ""))
+    assert window.confirm_discard() and not window.unsaved and copy.exists()
+    QtWidgets.QFileDialog.getSaveFileName = dialog
+    copy.unlink()
+    # Discard: allowed, explicitly.
+    window.unsaved = True
+    box.question = staticmethod(lambda *_a, **_k: box.Discard)
+    assert window.confirm_discard() and not window.unsaved
+    window.unsaved = True                     # for the History refusal and retry below
     warned = []
     box.warning = staticmethod(lambda *a, **_k: warned.append(a[2]))
     window.history_files = [blocker]
     window.open_stored(QtWidgets.QTableWidgetItem())
     assert warned and "not saved" in warned[0], warned
     box.warning = staticmethod(lambda *_a, **_k: None)
+    # A stopped worker still unwinding (mid-download) must block a second one.
+    class StillRunning(QtCore.QObject):
+        def isRunning(self):
+            return True
+    window.unsaved, window.retiring = False, StillRunning()
+    window.start()
+    assert window.worker is None and "Still stopping" in window.status.text()
+    window.unsaved, window.retiring = True, None
     # Once the folder is back, opening History retries the save by itself.
     rehapose.settings().setValue("dataDir", tmp)
     before = set(rehapose.session_dir().glob("*.csv"))
@@ -347,7 +379,7 @@ def check_shell(window, tmp, frame, poses):
     assert "duration_s" in head and "best_rom" in head, head
     assert head["best_joint"] in JOINTS, head
     assert head["app_version"] == rehapose.VERSION and head["mediapipe"] == "1.0.0", head
-    assert head["model"] == "lite", head            # from FakeWorker, via _detach
+    assert head["model"] == "heavy->lite", head     # the whole tier history, via _detach
 
     # The file is the user's only copy: what it reads back must be what was shown.
     stored = storage.stored_summaries(saved)
@@ -356,6 +388,21 @@ def check_shell(window, tmp, frame, poses):
         for field in ("rom", "peak", "min", "coverage"):
             assert abs(stored[joint][field] - live[field]) <= 0.05, (joint, field)
         assert stored[joint]["reps"] == live["reps"], joint
+
+    # A write that dies halfway (full disk) must leave no truncated session behind.
+    def half_write(part, *_a):
+        pathlib.Path(part).write_text("exercise,knee_flexion\r\n")
+        raise OSError(28, "No space left on device")
+    real_write, storage._write = storage._write, half_write
+    doomed = saved.with_name("20200105-000000-knee_flexion.csv")
+    try:
+        storage.write_session(doomed, [], window.summaries, window.times, window.angles)
+        raise AssertionError("a failed write was reported as saved")
+    except OSError:
+        pass
+    finally:
+        storage._write = real_write
+    assert not doomed.exists() and not list(saved.parent.glob("*.part")), "truncated file"
 
     # Two stops in the same second must give two files, not one overwritten.
     twin = window.autosave()
@@ -417,7 +464,7 @@ def check_shell(window, tmp, frame, poses):
     window._snapshot()
     window.remember_person()
     window.person.setText("CD")
-    window.on_person_changed()
+    window.person.textEdited.emit("CD")   # typing a code resets at once, not on focus-out
     assert window.age.value() == rehapose.AGE_UNSET, "new person inherited an age"
     assert window.sex.currentText() == rehapose.SEX_UNSET, "new person inherited a sex"
     window._snapshot()
@@ -444,6 +491,21 @@ def check_shell(window, tmp, frame, poses):
     assert storage.migrate_legacy(target) == 1
     assert [f.name for f in target.iterdir()] == ["20250101-000000-free.csv"]
     assert not list(legacy.iterdir()), "legacy original left behind"
+    # A copy that dies halfway must leave nothing under the real name, and no .part.
+    (legacy / "20250102-000000-free.csv").write_text("exercise,free\r\n" * 100)
+    def half_copy(src, dst):
+        pathlib.Path(dst).write_bytes(pathlib.Path(src).read_bytes()[:10])
+        raise OSError(28, "No space left on device")
+    real_copy, storage.shutil.copy2 = storage.shutil.copy2, half_copy
+    try:
+        storage.migrate_legacy(target)
+        raise AssertionError("a failed copy was reported as a migration")
+    except OSError:
+        pass
+    finally:
+        storage.shutil.copy2 = real_copy
+    assert not (target / "20250102-000000-free.csv").exists(), "truncated file kept"
+    assert not list(target.glob("*.part")) and (legacy / "20250102-000000-free.csv").exists()
     storage.LEGACY_SESSIONS = real_legacy
 
     # The sessions folder went missing and the picker was cancelled: keep the old

@@ -173,8 +173,20 @@ def write_session(path, header, summaries, times, angles):
     """Three blocks separated by blank rows: header key/value rows (two pairs per row at
     most, which is what read_header understands), per-joint summary, per-frame trace."""
     joints = list(summaries)
+    path = Path(path)
+    # Written to a side name and swapped in, so a full disk leaves no truncated session
+    # under a real name - History would list it, and every save retry would add another.
+    part = path.with_name(path.name + ".part")
+    try:
+        _write(part, header, summaries, times, angles, joints)
+        os.replace(part, path)
+    finally:
+        part.unlink(missing_ok=True)
+
+
+def _write(part, header, summaries, times, angles, joints):
     # utf-8-sig: the BOM is what makes Excel show the degree sign instead of mojibake.
-    with open(path, "w", newline="", encoding="utf-8-sig") as handle:
+    with open(part, "w", newline="", encoding="utf-8-sig") as handle:
         writer = csv.writer(handle)
         writer.writerows(header)
         writer.writerow([])

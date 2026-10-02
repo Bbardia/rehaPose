@@ -147,7 +147,10 @@ class Main(QtWidgets.QMainWindow):
                                "every session file.")
         self.person.setMaxLength(24)
         self.person.setFixedWidth(130)
-        self.person.editingFinished.connect(self.on_person_changed)
+        # textEdited, not editingFinished: on macOS buttons and combos do not take focus on
+        # click, so editingFinished never fired before Start and then wiped the age and
+        # sex picked after typing the code. Fires on user edits only, not on setText().
+        self.person.textEdited.connect(self.on_person_changed)
         self.last_person = ""
         self.age = QtWidgets.QSpinBox()
         self.age.setRange(AGE_UNSET, 99)
@@ -503,7 +506,6 @@ class Main(QtWidgets.QMainWindow):
         self.counted, self.time_called, self.final_counted = None, False, False
         self.clock_start, self.setup_ok, self.frames, self.good_run = None, 0, 0, 0
         self.summaries, self.viewing_stored = {}, None
-        self.on_person_changed()     # Cmd+R from inside the field skips editingFinished
         self._snapshot()
         self.remember_person()
         for joint, curve in self.curves.items():

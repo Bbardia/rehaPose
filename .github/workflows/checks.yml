@@ -21,7 +21,7 @@ jobs:
         with:
           path: ~/.cache/rehapose
           # The model URL and MD5s are pinned, so the cache is valid until they change.
-          key: rehapose-models-${{ hashFiles('rehapose.py') }}
+          key: rehapose-models-${{ hashFiles('capture.py') }}
           restore-keys: rehapose-models-
       - run: pip install -r requirements.txt ruff==0.16.8   # bump deliberately
       - run: ruff check .
