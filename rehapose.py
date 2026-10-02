@@ -10,6 +10,7 @@ import contextlib
 import csv
 import datetime
 import math
+import shutil
 import struct
 import sys
 import time
@@ -47,12 +48,15 @@ def settings():
 
 
 def session_dir():
-    """Where sessions live, or None if the user has not chosen yet."""
+    """Where sessions live, or None if not chosen yet or no longer reachable."""
     chosen = settings().value("dataDir", "", type=str)
     if not chosen:
         return None
     path = Path(chosen) / "sessions"
-    path.mkdir(parents=True, exist_ok=True)
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return None   # unplugged drive, revoked permission, or the folder became a file
     return path
 
 
@@ -65,19 +69,29 @@ def choose_data_dir(parent):
     existing = session_dir()
     if existing is not None:
         return existing
+    previous = settings().value("dataDir", "", type=str)
     default = Path(QtCore.QStandardPaths.writableLocation(
         QtCore.QStandardPaths.DocumentsLocation)) / "rehaPose"
     QtWidgets.QMessageBox.information(
         parent, "rehaPose",
-        "Choose a folder to keep your sessions in.\n\n"
-        "Each session is a CSV you can open, back up or send on. Video is never "
-        "saved and never leaves this machine.")
+        (f"The sessions folder {previous} is not available - is a drive unplugged?\n\n"
+         "Choose where to keep sessions. Pick the same folder again once it is back."
+         if previous else
+         "Choose a folder to keep your sessions in.\n\n"
+         "Each session is a CSV you can open, back up or send on. Video is never "
+         "saved and never leaves this machine."))
     picked = QtWidgets.QFileDialog.getExistingDirectory(
         parent, "Keep sessions in", str(default.parent))
     root = Path(picked) if picked else default
-    root.mkdir(parents=True, exist_ok=True)
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+        (root / "sessions").mkdir(exist_ok=True)
+        moved = migrate_legacy(root / "sessions")
+    except OSError as exc:
+        QtWidgets.QMessageBox.warning(parent, "rehaPose",
+                                      f"Cannot keep sessions in {root}: {exc.strerror or exc}")
+        return None
     settings().setValue("dataDir", str(root))
-    moved = migrate_legacy(root / "sessions")
     if moved:
         QtWidgets.QMessageBox.information(
             parent, "rehaPose", f"Moved {moved} earlier session(s) into {root}.")
@@ -93,7 +107,7 @@ def migrate_legacy(target):
     for old in LEGACY_SESSIONS.glob("*.csv"):
         new = target / old.name
         if not new.exists():
-            old.rename(new)
+            shutil.move(old, new)   # rename() fails when the target is another volume
             moved += 1
     return moved
 
@@ -123,13 +137,18 @@ def ensure_model(tier):
 class PoseWorker(QtCore.QThread):
     """Camera capture + inference, off the GUI thread so the UI never stalls."""
 
-    ready = QtCore.pyqtSignal(object, object, float)   # bgr frame, world landmarks|None, ms
+    # bgr frame, (pixel, world) - each None when no pose was found, inference ms
+    ready = QtCore.pyqtSignal(object, object, float)
     status = QtCore.pyqtSignal(str)
     failed = QtCore.pyqtSignal(str)
 
-    def __init__(self, camera=0):
-        super().__init__()
+    def __init__(self, camera=0, parent=None):
+        # Parented so Qt, not Python's refcount, decides when the thread object dies:
+        # dropping the last reference to a QThread that is still running (say, mid
+        # model download when Stop is pressed) aborts the whole process.
+        super().__init__(parent)
         self.camera = camera
+        self.tier = TIERS[0]
         self._stop = False
 
     def stop(self):
@@ -217,6 +236,7 @@ class PoseWorker(QtCore.QThread):
                 if tier is not None:
                     landmarker.close()
                     landmarker = self._make(TIERS[tier])
+                    self.tier = TIERS[tier]
                     self.status.emit(
                         f"Backend: MediaPipe {TIERS[tier]} (auto: too slow for "
                         f"{TIERS[tier - 1]})")
@@ -256,7 +276,7 @@ def read_header(path):
     """Block 1 of a session file as a dict. Files are written with csv.writer, so they
     must be read back with csv.reader on newline="" - the line endings are CRLF."""
     head = {}
-    with open(path, newline="") as handle:
+    with open(path, newline="", encoding="utf-8-sig", errors="replace") as handle:
         for row in csv.reader(handle):
             if not row:
                 break
@@ -270,7 +290,7 @@ def read_header(path):
 def read_joints(path):
     """Block 2 of a session file: {joint: {column: value}}."""
     rows, section = {}, 0
-    with open(path, newline="") as handle:
+    with open(path, newline="", encoding="utf-8-sig", errors="replace") as handle:
         for row in csv.reader(handle):
             if not row:
                 section += 1
@@ -316,6 +336,7 @@ class Main(QtWidgets.QMainWindow):
         self.frames = 0
         self.summaries = {}
         self.viewing_stored = None
+        self.model_tier = ""
         self.sound = QtMultimedia.QSoundEffect()
         self.sound.setSource(QtCore.QUrl.fromLocalFile(str(make_beep(MODEL_DIR / "rep.wav"))))
         self.setWindowTitle("rehaPose")
@@ -388,6 +409,7 @@ class Main(QtWidgets.QMainWindow):
         self._build_menus()
         self.restore_settings()
         self.on_exercise_changed()
+        self._snapshot()
         self._sync()
 
     def _build_menus(self):
@@ -433,6 +455,8 @@ class Main(QtWidgets.QMainWindow):
 
     def open_folder(self):
         target = choose_data_dir(self)
+        if target is None:
+            return
         QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(str(target)))
 
     def restore_settings(self):
@@ -522,6 +546,8 @@ class Main(QtWidgets.QMainWindow):
 
     def show_history(self):
         target = choose_data_dir(self)
+        if target is None:
+            return
         rows = sorted(target.glob("*.csv"), reverse=True)
         self.sessions.setRowCount(len(rows))
         self.history_files = rows
@@ -591,6 +617,16 @@ class Main(QtWidgets.QMainWindow):
     def chair_mode(self):
         return bool({k: s for k, _, s in EXERCISES}.get(self.exercise_key))
 
+    @property
+    def measured(self):
+        return any(self.times.values())
+
+    def _snapshot(self):
+        """What is being recorded, frozen at Start. The widgets unlock again on Stop, so
+        reading them at save time filed a copy under whatever the combo said by then."""
+        self.recorded = {"exercise": self.exercise_key, "chair": self.chair_mode,
+                         "age": self.age.value(), "sex": self.sex.currentText()}
+
     def start(self):
         if choose_data_dir(self) is None:
             return
@@ -600,26 +636,40 @@ class Main(QtWidgets.QMainWindow):
         self.stands, self.stand_count = [], 0
         self.clock_start, self.setup_ok, self.frames = None, 0, 0
         self.summaries, self.viewing_stored = {}, None
+        self._snapshot()
         for joint, curve in self.curves.items():
             curve.setData([], [])
             self.plots[joint].setTitle(joint.replace("_", " "))
         self.stack.setCurrentIndex(0)
         self.pages.setCurrentIndex(0)
         self.t0 = time.perf_counter()
-        self.worker = PoseWorker(self.camera)
+        self.worker = PoseWorker(self.camera, parent=self)
+        self.worker.finished.connect(self.worker.deleteLater)
         self.worker.ready.connect(self.on_frame)
         self.worker.status.connect(self.on_status)
         self.worker.failed.connect(self.on_failed)
         self.worker.start()
         self._sync()
 
+    def _stale(self):
+        """True for a signal from a worker that has already been let go. One frame is
+        nearly always still queued when Stop is pressed; it used to land after the
+        autosave, overwrite the "Saved" line, and could even count a stand."""
+        sender = self.sender()
+        return sender is not None and sender is not self.worker
+
+    def _detach(self):
+        worker, self.worker = self.worker, None
+        if worker is not None:
+            worker.stop()
+            worker.wait(2000)
+            self.model_tier = worker.tier
+
     def stop(self):
         if not self.worker:
             return
-        self.worker.stop()
-        self.worker.wait(2000)
-        self.worker = None
-        if self.clock_start is None:
+        self._detach()
+        if not self.measured:
             # Nothing was ever measured - the framing never came good. Writing this
             # would put an all-zeros row at the top of History.
             self.video.setText(TIPS)
@@ -631,12 +681,21 @@ class Main(QtWidgets.QMainWindow):
         self._sync()
 
     def on_status(self, message):
+        if self._stale():
+            return
         self.backend = message
         self.status.setText(message)
 
     def on_failed(self, message):
-        self.worker = None
-        self.status.setText(message)
+        if self._stale():
+            return
+        self._detach()
+        if self.measured:
+            # A camera that drops out mid-set used to take the whole recording with it.
+            self.show_results()
+            message += "\n\nThe session up to that point was kept.\n" + self.status.text()
+        else:
+            self.status.setText(message)
         self._sync()
         QtWidgets.QMessageBox.critical(self, "rehaPose", message)
 
@@ -678,6 +737,8 @@ class Main(QtWidgets.QMainWindow):
         return current
 
     def on_frame(self, frame, landmarks, dt):
+        if self._stale():
+            return
         pixel, world = landmarks
         ok, hint = self.gate(pixel, world, frame)
         if self.clock_start is None:
@@ -696,7 +757,7 @@ class Main(QtWidgets.QMainWindow):
         self.update_plots(now, current)
 
         note = "" if ok else f"   |   {hint}"
-        if self.chair_mode:
+        if self.recorded["chair"]:
             self.tick_chair_stand(now, note)
         else:
             self.status.setText(f"{self.backend}  |  {dt:.0f} ms/frame  "
@@ -749,31 +810,39 @@ class Main(QtWidgets.QMainWindow):
                     item.setForeground(QtGui.QBrush(QtGui.QColor("#a06060")))
                 self.results.setItem(row, col, item)
         self.stack.setCurrentIndex(1)
-        self.export.setEnabled(True)
-        self.status.setText(self.verdict())
+        try:
+            saved = f"Saved {self.autosave().name}"
+        except OSError as exc:
+            # A full disk or unplugged drive used to raise straight out of this slot -
+            # PyQt5's qFatal path, exit 134, and the session gone with the process.
+            saved = (f"NOT SAVED ({exc.strerror or exc}) - use File > Save a Copy "
+                     "before you start another session.")
+        self.status.setText(f"{self.verdict()}  {saved}")
 
     def verdict(self):
         total = max((t[-1] for t in self.times.values() if t), default=0.0)
         framing = 100.0 * self.setup_ok / max(self.frames, 1)
-        saved = self.autosave()
-        if self.chair_mode:
-            norm = chair_stand_norm(self.age.value(), self.sex.currentText())
-            reference = (f"Reference for an independent {self.sex.currentText()} aged "
-                         f"{self.age.value()}: {norm}." if norm else
+        rec = self.recorded
+        if rec["chair"]:
+            norm = chair_stand_norm(rec["age"], rec["sex"])
+            reference = (f"Reference for an independent {rec['sex']} aged "
+                         f"{rec['age']}: {norm}." if norm else
                          "No published reference for this age.")
             return (f"Chair stands: {self.stand_count}.  {reference}  "
                     f"Protocol: 43-45 cm chair against a wall, arms crossed at the chest, "
                     f"full stand each rep - the app cannot check this.  "
-                    f"Framing good in {framing:.0f}% of frames.  Saved {saved.name}")
+                    f"Framing good in {framing:.0f}% of frames.")
         return (f"Session: {total:.0f}s.  Framing good in {framing:.0f}% of frames.  "
-                f"Rows below {MIN_COVERAGE:.0f}% tracked are not reported.  "
-                f"Saved {saved.name}")
+                f"Rows below {MIN_COVERAGE:.0f}% tracked are not reported.")
 
     def autosave(self):
         """Every session is written on stop. Pressing Start again used to discard the
         previous one silently, with the only copy behind a Save dialog nobody clicked."""
+        target = session_dir()
+        if target is None:
+            raise OSError("the sessions folder is not available")
         stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-        path = session_dir() / f"{stamp}-{self.exercise_key}.csv"
+        path = target / f"{stamp}-{self.recorded['exercise']}.csv"
         self.write_csv(path)
         return path
 
@@ -782,18 +851,19 @@ class Main(QtWidgets.QMainWindow):
         best = max((s["rom"] for s in self.summaries.values()
                     if s["coverage"] >= MIN_COVERAGE), default=0.0)
         duration = max((t[-1] for t in self.times.values() if t), default=0.0)
-        with open(path, "w", newline="") as handle:
+        rec = self.recorded
+        # utf-8-sig: the BOM is what makes Excel show the degree sign instead of mojibake.
+        with open(path, "w", newline="", encoding="utf-8-sig") as handle:
             writer = csv.writer(handle)
-            # The KEY, never the display text: History groups on this, and renaming a
+            # The KEY, never the display text: History shows this, and renaming a
             # label must not orphan every session recorded before the rename.
-            writer.writerow(["exercise", self.exercise_key])
+            writer.writerow(["exercise", rec["exercise"]])
             writer.writerow(["duration_s", f"{duration:.0f}"])
             writer.writerow(["best_rom", f"{best:.0f}°"])
-            if self.chair_mode:
+            if rec["chair"]:
                 writer.writerow(["stands", self.stand_count])
-                writer.writerow(["age", self.age.value(), "sex", self.sex.currentText()])
-                writer.writerow(["reference", chair_stand_norm(self.age.value(),
-                                                               self.sex.currentText())])
+                writer.writerow(["age", rec["age"], "sex", rec["sex"]])
+                writer.writerow(["reference", chair_stand_norm(rec["age"], rec["sex"])])
             framing = 100.0 * self.setup_ok / max(self.frames, 1)
             writer.writerow(["framing_good_pct", f"{framing:.1f}"])
             writer.writerow([])
@@ -815,9 +885,15 @@ class Main(QtWidgets.QMainWindow):
     def save_csv(self):
         path, _ = QtWidgets.QFileDialog.getSaveFileName(
             self, "Save a copy", "rehapose_session.csv", "CSV (*.csv)")
-        if path:
+        if not path:
+            return
+        try:
             self.write_csv(path)
-            self.status.setText(f"Saved {path}")
+        except OSError as exc:
+            QtWidgets.QMessageBox.warning(self, "rehaPose",
+                                          f"Could not save {path}: {exc.strerror or exc}")
+            return
+        self.status.setText(f"Saved {path}")
 
     def closeEvent(self, event):
         # Quitting mid-session used to write the CSV and vanish in the same tick, so the

@@ -19,7 +19,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import analysis
 import rehapose
 from analysis import JOINTS
-from PyQt5 import QtWidgets
+from PyQt5 import QtCore, QtWidgets
 
 
 SAMPLE_URL = ("https://raw.githubusercontent.com/open-mmlab/mmpose/main/"
@@ -107,7 +107,9 @@ def main():
     window.show_results()
     assert window.stack.currentIndex() == 1
     assert window.results.item(0, 0) is not None, "results table not populated"
+    window._sync()                    # stop() does this; _sync is the only enabler
     assert window.export.isEnabled()
+    assert "Saved" in window.status.text(), window.status.text()
 
     # Every session must be written on stop, without anyone clicking Save.
     written = set(rehapose.session_dir().glob("*.csv")) - before
@@ -128,6 +130,7 @@ def main():
                                hi=analysis.CHAIR_STAND_HI) == 7
     window.age.setValue(72)
     window.sex.setCurrentText("female")
+    window._snapshot()                # start() does this
     window.stand_count = 7
     line = window.verdict()
     assert "Chair stands: 7" in line and "14" in line, line
@@ -139,12 +142,14 @@ def main():
     window.on_frame(frame.copy(), (None, None), 7.0)
     assert window.angles["left_knee"][-1] is None
 
-    check_shell(window, tmp)
+    check_shell(window, tmp, frame, poses)
     print(f"smoke test passed ({detected}/30 frames tracked)")
 
 
 class FakeWorker:
     """Stands in for PoseWorker so stop() can be exercised without a camera."""
+
+    tier = "lite"
 
     def stop(self):
         pass
@@ -153,7 +158,7 @@ class FakeWorker:
         return True
 
 
-def check_shell(window, tmp):
+def check_shell(window, tmp, frame, poses):
     """The app shell: state machine, menus, history round-trip, junk-session guard."""
     # Modal dialogs block forever offscreen, so silence them for the duration.
     QtWidgets.QMessageBox.critical = staticmethod(lambda *_a, **_k: None)
@@ -166,24 +171,52 @@ def check_shell(window, tmp):
     window._sync()
     assert not window.exercise.isEnabled() and not window.act_history.isEnabled()
     assert window.button.text() == "Stop" and window.act_run.text() == "Stop"
-    window.worker = None
+    # A camera that dies mid-session must keep what was already recorded.
+    before = set(rehapose.session_dir().glob("*.csv"))
     window.on_failed("camera exploded")
+    assert window.worker is None
     assert window.exercise.isEnabled(), "combo stuck disabled after a failure"
     assert window.button.text() == "Start"
+    kept = set(rehapose.session_dir().glob("*.csv")) - before
+    assert len(kept) == 1, "camera failure threw the recording away"
+    kept.pop().unlink()
+
+    # A frame still queued from a stopped worker must be dropped, not recorded.
+    class OldWorker(QtCore.QObject):
+        ready = QtCore.pyqtSignal(object, object, float)
+    old = OldWorker()
+    old.ready.connect(window.on_frame)
+    count = len(window.angles["left_knee"])
+    old.ready.emit(frame.copy(), poses[0], 7.0)
+    assert len(window.angles["left_knee"]) == count, "stale frame was recorded"
+
+    # A save that fails on Stop must say so, not take the process down (exit 134).
+    blocker = pathlib.Path(tmp) / "not-a-folder"
+    blocker.write_text("")
+    rehapose.settings().setValue("dataDir", str(blocker))
+    window.show_results()
+    assert "NOT SAVED" in window.status.text(), window.status.text()
+    rehapose.settings().setValue("dataDir", tmp)
 
     # Stopping with nothing ever measured must not write an all-zeros session.
+    recorded, window.times = window.times, {j: [] for j in JOINTS}
     window.summaries = {}
-    window.worker, window.clock_start = FakeWorker(), None
+    window.worker = FakeWorker()
     before = set(rehapose.session_dir().glob("*.csv"))
     window.stop()
     assert window.worker is None
     assert set(rehapose.session_dir().glob("*.csv")) == before, "junk session written"
+    window.times = recorded
 
     # Exercise keys, not display text, are what land in the file and drive History.
     window.exercise.setCurrentIndex(window.exercise.findData("knee_flexion"))
+    window._snapshot()
+    # Changing the combo after Stop must not relabel what was recorded.
+    window.exercise.setCurrentIndex(window.exercise.findData("heel_slides"))
     window.summaries = {j: analysis.summarize(window.angles[j]) for j in JOINTS}
     saved = window.autosave()
     assert saved.name.endswith("-knee_flexion.csv"), saved.name
+    window.exercise.setCurrentIndex(window.exercise.findData("knee_flexion"))
     head = rehapose.read_header(saved)
     assert head["exercise"] == "knee_flexion", head
     assert "duration_s" in head and "best_rom" in head, head
