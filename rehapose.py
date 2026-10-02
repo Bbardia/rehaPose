@@ -24,7 +24,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 import pyqtgraph as pg
-from PyQt5 import QtCore, QtGui, QtMultimedia, QtWidgets
+from PyQt5 import QtCore, QtGui, QtMultimedia, QtWidgets, sip
 
 from analysis import (CHAIR_STAND_HI, CHAIR_STAND_LO, CHAIR_STAND_SECONDS,
                       CONNECTIONS, EXERCISE_DISPLAY, EXERCISES, JOINTS, OneEuro,
@@ -158,11 +158,8 @@ class PoseWorker(QtCore.QThread):
     status = QtCore.pyqtSignal(str)
     failed = QtCore.pyqtSignal(str)
 
-    def __init__(self, camera=0, parent=None):
-        # Parented so Qt, not Python's refcount, decides when the thread object dies:
-        # dropping the last reference to a QThread that is still running (say, mid
-        # model download when Stop is pressed) aborts the whole process.
-        super().__init__(parent)
+    def __init__(self, camera=0):
+        super().__init__()
         self.camera = camera
         self.tier = TIERS[0]
         self._stop = False
@@ -743,8 +740,7 @@ class Main(QtWidgets.QMainWindow):
         self.stack.setCurrentIndex(0)
         self.pages.setCurrentIndex(0)
         self.t0 = time.perf_counter()
-        self.worker = PoseWorker(self.camera, parent=self)
-        self.worker.finished.connect(self.worker.deleteLater)
+        self.worker = PoseWorker(self.camera)
         self.worker.ready.connect(self.on_frame)
         self.worker.status.connect(self.on_status)
         self.worker.failed.connect(self.on_failed)
@@ -762,7 +758,13 @@ class Main(QtWidgets.QMainWindow):
         worker, self.worker = self.worker, None
         if worker is not None:
             worker.stop()
-            worker.wait(2000)
+            if not worker.wait(2000):
+                # Still inside a model download or load. Destroying a running QThread is
+                # a qFatal abort - whether Python's refcount does it now or the window's
+                # teardown does it at quit - so hand it to C++ with no parent: it is
+                # freed when it finishes, or simply never, if the app exits first.
+                sip.transferto(worker, None)
+                worker.finished.connect(worker.deleteLater)
             self.model_tier = worker.tier
 
     def stop(self):
