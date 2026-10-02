@@ -40,7 +40,10 @@ TIPS = ("Stand side-on to the camera, with your whole body in frame.\n\n"
 
 
 def settings():
-    return QtCore.QSettings("rehaPose", "rehaPose")
+    # No arguments: resolve from the QApplication's organization/application names.
+    # Hardcoding ("rehaPose", "rehaPose") here made the smoke test's "rehaPoseTest"
+    # name a no-op, so every test run pointed the REAL dataDir at a temp folder.
+    return QtCore.QSettings()
 
 
 def session_dir():

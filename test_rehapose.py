@@ -42,6 +42,7 @@ def main():
     app = QtWidgets.QApplication(sys.argv)
     app.setOrganizationName("rehaPose")
     app.setApplicationName("rehaPoseTest")     # never touch the real preferences
+    assert "rehaPoseTest" in rehapose.settings().fileName(), rehapose.settings().fileName()
     # Point the data dir at a scratch folder so the first-run chooser stays silent.
     tmp = tempfile.mkdtemp(prefix="rehapose-test-")
     rehapose.settings().setValue("dataDir", tmp)
