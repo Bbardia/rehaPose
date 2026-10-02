@@ -44,13 +44,28 @@ def main():
     app.setOrganizationName("rehaPose")
     app.setApplicationName("rehaPoseTest")     # never touch the real preferences
     assert "rehaPoseTest" in rehapose.settings().fileName(), rehapose.settings().fileName()
+    # Modal dialogs block forever offscreen, so a regression that opens one would hang
+    # the run instead of failing it. Silence them before anything can open one.
+    QtWidgets.QMessageBox.critical = staticmethod(lambda *_a, **_k: None)
+    QtWidgets.QMessageBox.warning = staticmethod(lambda *_a, **_k: None)
+    QtWidgets.QMessageBox.information = staticmethod(lambda *_a, **_k: None)
     # Point the data dir at a scratch folder so the first-run chooser stays silent.
     tmp = tempfile.mkdtemp(prefix="rehapose-test-")
+    try:
+        run(app, tmp)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def run(app, tmp):
     rehapose.settings().clear()           # last run's saved exercise must not leak in
     rehapose.settings().setValue("dataDir", tmp)
     assert rehapose.session_dir() == pathlib.Path(tmp) / "sessions"
 
     window = rehapose.Main(camera=0)
+    # Nobody has entered an age or sex yet, so neither may default to a real value.
+    assert window.age.value() == rehapose.AGE_UNSET, window.age.value()
+    assert window.sex.currentText() == rehapose.SEX_UNSET, window.sex.currentText()
     window.exercise.setCurrentIndex(window.exercise.findData("knee_flexion"))
     window._snapshot()
 
@@ -86,9 +101,27 @@ def main():
 
     # The real gate on real landmarks must produce a real cosine. Which way it decides on
     # this one photo is not the point - analysis.demo() checks that against known yaws.
-    pixel, world = poses[0]
+    pixel, world = poses[-1]
     cos = analysis.orientation_cos(pixel, world, frame.shape[1], frame.shape[0])
     assert cos is not None and 0.0 <= cos <= 1.0, cos
+    # Mirroring the photo turns the same body the other way; the gate must read nearly
+    # the same turn. On heavy, the default tier, shoulders alone moved 0.44 -> 0.81 for
+    # this photo; shoulders and hips averaged move 0.54 -> 0.65.
+    turns = []
+    for image_bgr in (frame, cv2.flip(frame, 1)):
+        heavy = vision.PoseLandmarker.create_from_options(
+            vision.PoseLandmarkerOptions(
+                base_options=mpp.BaseOptions(model_asset_path=str(rehapose.ensure_model(
+                    "heavy"))), running_mode=vision.RunningMode.VIDEO, num_poses=1))
+        still = mp.Image(image_format=mp.ImageFormat.SRGB,
+                         data=cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB))
+        for i in range(15):
+            res = heavy.detect_for_video(still, (i + 1) * 33)
+        heavy.close()
+        turns.append(analysis.orientation_cos(res.pose_landmarks[0],
+                                              res.pose_world_landmarks[0],
+                                              frame.shape[1], frame.shape[0]))
+    assert abs(turns[0] - turns[1]) < 0.15, turns
     # A refused setup must show the camera but record nothing.
     rehapose.setup_check = lambda *_a, **_k: (False, "Turn side-on to the camera.")
     window.on_frame(frame.copy(), poses[0], 7.0)
@@ -96,8 +129,12 @@ def main():
     assert all(not window.angles[j] for j in JOINTS), "gated frames were still recorded"
     assert window.video.pixmap() is not None, "gate should still show the camera"
 
-    # With the setup good, the same frames must record normally.
+    # With the setup good, the same frames must record normally - once it has held for
+    # SETUP_HOLD frames, so a single lucky frame cannot start a session.
     rehapose.setup_check = lambda *_a, **_k: (True, "Setup looks good.")
+    for _ in range(rehapose.SETUP_HOLD - 1):
+        window.on_frame(frame.copy(), poses[0], 7.0)
+    assert window.clock_start is None, "one good frame short of the hold, and it started"
     for i, landmark_pair in enumerate(poses):
         window.t0 = -(i / 30.0)  # advance the clock without sleeping
         window.on_frame(frame.copy(), landmark_pair, 7.0)
@@ -167,6 +204,7 @@ def check_chair_stand(window, app, frame, poses):
     window.stands, window.stand_count, window.clock_start = [], 0, None
     window.counted, window.time_called, window.final_counted = None, False, False
     window.frames = window.setup_ok = 0
+    window.good_run = rehapose.SETUP_HOLD - 1
     window.on_frame(frame.copy(), poses[0], 7.0)
     assert window.clock_start > time.perf_counter(), "no countdown before a scored test"
     assert "starting in 3" in window.status.text(), window.status.text()
@@ -199,6 +237,16 @@ def check_chair_stand(window, app, frame, poses):
     assert "Chair stands: 4" in window.status.text(), window.status.text()
     for extra in rehapose.session_dir().glob("*.csv"):
         extra.unlink()
+
+    # Stopped by hand: the file, History and the stored view must all say so.
+    window.viewing_stored, window.time_called = None, False
+    saved = window.autosave()
+    assert rehapose.read_header(saved)["complete"] == "no"
+    window.show_history()
+    assert "(stopped early)" in window.sessions.item(0, 4).text()
+    window.open_stored(window.sessions.item(0, 0))
+    assert "stopped before 30 s" in window.status.text(), window.status.text()
+    saved.unlink()
     window.times, window.angles, window.stands = kept
 
 
@@ -219,10 +267,6 @@ real_session_dir = rehapose.session_dir
 
 def check_shell(window, tmp, frame, poses):
     """The app shell: state machine, menus, history round-trip, junk-session guard."""
-    # Modal dialogs block forever offscreen, so silence them for the duration.
-    QtWidgets.QMessageBox.critical = staticmethod(lambda *_a, **_k: None)
-    QtWidgets.QMessageBox.warning = staticmethod(lambda *_a, **_k: None)
-    QtWidgets.QMessageBox.information = staticmethod(lambda *_a, **_k: None)
     # _sync is the only place widgets are enabled. Recording locks the exercise combo
     # and History; idle unlocks them. The old code left the combo disabled forever
     # after a camera error, because on_failed reset the button but not the combo.
@@ -330,20 +374,24 @@ def check_shell(window, tmp, frame, poses):
     mangled.write_bytes(saved.read_text(encoding="utf-8-sig").encode("cp1252"))
     junk = saved.with_name("20200102-000000-other.csv")
     junk.write_bytes(b"\x00\xff garbage\r\n\r\njoint\r\nleft_knee,notanumber\r\n")
+    unopenable = saved.with_name("20200103-000000-dir.csv")
+    unopenable.mkdir()                                 # open() raises IsADirectoryError
 
     # History must read what autosave wrote, and round-trip it back into the results.
     window.show_history()
     assert window.pages.currentIndex() == 1
-    assert window.sessions.rowCount() == 3, window.sessions.rowCount()
+    assert window.sessions.rowCount() == 4, window.sessions.rowCount()
+    assert window.sessions.item(1, 2).text() == "(unreadable)"
     assert window.sessions.item(0, 2).text() == "Knee flexion / extension"
     assert head["best_joint"].replace("_", " ") in window.sessions.item(0, 4).text()
     # The degree sign decodes as U+FFFD; the number, which is what matters, survives.
-    assert any(c.isdigit() for c in window.sessions.item(2, 4).text()), "cp1252 row lost"
+    assert any(c.isdigit() for c in window.sessions.item(3, 4).text()), "cp1252 row lost"
     viewing = window.viewing_stored
-    window.open_stored(window.sessions.item(1, 0))      # junk: a warning, not a crash
+    window.open_stored(window.sessions.item(2, 0))      # junk: a warning, not a crash
     assert window.viewing_stored == viewing, "a refused file still took over the view"
     mangled.unlink()
     junk.unlink()
+    unopenable.rmdir()
     window.show_history()
     window.open_stored(window.sessions.item(0, 0))
     assert window.pages.currentIndex() == 0 and window.stack.currentIndex() == 1
@@ -359,27 +407,31 @@ def check_shell(window, tmp, frame, poses):
 
     # Age and sex follow the person code, so one patient's norm never lands on the next.
     window.person.setText("AB")
-    window.on_person_changed()            # a new code asks for the age again...
+    window.on_person_changed()            # a new code asks for age and sex again...
     assert window.age.value() == rehapose.AGE_UNSET
-    window.age.setValue(72)               # ...which is entered after it
+    assert window.sex.currentText() == rehapose.SEX_UNSET
+    window.age.setValue(72)               # ...which are entered after it
+    window.sex.setCurrentText("male")
     window._snapshot()
     window.remember_person()
     window.person.setText("CD")
     window.on_person_changed()
     assert window.age.value() == rehapose.AGE_UNSET, "new person inherited an age"
+    assert window.sex.currentText() == rehapose.SEX_UNSET, "new person inherited a sex"
     window._snapshot()
-    assert window.recorded["age"] is None
+    assert window.recorded["age"] is None and window.recorded["sex"] is None
     window.recorded["chair"], window.time_called = True, True
-    assert "Age not entered" in window.verdict(), window.verdict()
+    assert "not entered" in window.verdict(), window.verdict()
     saved = window.autosave()
     head = rehapose.read_header(saved)
-    assert head["person"] == "CD" and head["age"] == "", head
+    assert head["person"] == "CD" and head["age"] == "" and head["sex"] == "", head
     window.show_history()
     assert window.sessions.item(0, 1).text() == "CD"
     saved.unlink()
     window.person.setText("AB")
     window.on_person_changed()
     assert window.age.value() == 72, "known person's age was not restored"
+    assert window.sex.currentText() == "male", "known person's sex was not restored"
 
     # Legacy sessions move across whole, leaving no half-copied file behind.
     legacy = pathlib.Path(tmp) / "legacy"
@@ -414,8 +466,6 @@ def check_shell(window, tmp, frame, poses):
     assert rehapose.settings().value("age", type=int) == 81
     assert rehapose.settings().value("exercise", type=str) == "knee_flexion"
     assert rehapose.settings().value("beep", True, type=bool) is False
-
-    shutil.rmtree(tmp, ignore_errors=True)
 
 
 if __name__ == "__main__":

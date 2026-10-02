@@ -213,17 +213,24 @@ def orientation_cos(pixel, world, frame_w, frame_h):
     frame's aspect ratio rather than the body: verified 0.387 to 1.247 on one unchanged
     pose, which is also impossible for a cosine.
     """
-    span_px = abs(pixel[11].x - pixel[12].x) * frame_w
     torso_px = abs((pixel[11].y + pixel[12].y) / 2 - (pixel[23].y + pixel[24].y) / 2) * frame_h
-    # The TRUE 3D shoulder width, not its x component. World landmarks are camera-
-    # aligned, so world x shrinks with yaw exactly as the image does and the ratio
-    # cancelled the very turn it exists to measure: ~1.0 at every yaw.
-    span_m = math.dist((world[11].x, world[11].y, world[11].z),
-                       (world[12].x, world[12].y, world[12].z))
     torso_m = abs((world[11].y + world[12].y) / 2 - (world[23].y + world[24].y) / 2)
-    if torso_px < 1e-6 or span_m < 1e-9 or torso_m < 1e-9:
+    if torso_px < 1e-6 or torso_m < 1e-9:
         return None
-    return min(1.0, (span_px / torso_px) / (span_m / torso_m))
+    ratios = []
+    # Shoulders AND hips, averaged: each pair's 3D width leans on MediaPipe's noisiest
+    # axis (z), and on one mirrored photo the shoulder ratio alone moved 0.44 -> 0.81
+    # while the mean moved 0.54 -> 0.65.
+    for a, b in ((11, 12), (23, 24)):
+        span_px = abs(pixel[a].x - pixel[b].x) * frame_w
+        # The TRUE 3D width, not its x component. World landmarks are camera-aligned,
+        # so world x shrinks with yaw exactly as the image does and the ratio
+        # cancelled the very turn it exists to measure: ~1.0 at every yaw.
+        span_m = math.dist((world[a].x, world[a].y, world[a].z),
+                           (world[b].x, world[b].y, world[b].z))
+        if span_m > 1e-9:
+            ratios.append((span_px / torso_px) / (span_m / torso_m))
+    return min(1.0, sum(ratios) / len(ratios)) if ratios else None
 
 
 def setup_check(pixel, world, frame_w, frame_h, view="side", margin=0.02):
@@ -275,6 +282,10 @@ EXERCISE_DISPLAY = {key: display for key, display, _ in EXERCISES}
 CHAIR_STAND_SECONDS = 30.0
 CHAIR_STAND_LO = 20.0   # knee flexion below this = standing
 CHAIR_STAND_HI = 70.0   # knee flexion above this = seated
+# "More than halfway up" for the final stand. Hip height over the seat is ~thigh*cos(knee
+# flexion) with the shank near vertical, so halfway is ~60 deg, not the 45 deg midpoint
+# of the two thresholds - 45 is ~70% of the rise and under-counts the protocol.
+CHAIR_STAND_HALF = 60.0
 
 # Rikli & Jones criterion for maintaining physical independence, via SRALab.
 # (age_low, age_high): (women, men)
@@ -289,19 +300,17 @@ def chair_stand_score(knee, lo=CHAIR_STAND_LO, hi=CHAIR_STAND_HI):
 
     The published protocol counts a final stand if the participant is more than halfway
     up at 30 s. Without that rule the count sits one below the protocol the norms were
-    built on, for anyone caught mid-rise. "Halfway" is the knee-angle midpoint of the two
-    thresholds - ponytail: knee angle is not linear in seat height, but at 45 deg between
-    a 70 deg seat and a 20 deg stand the rise is well past its halfway point either way.
+    built on, for anyone caught mid-rise. See CHAIR_STAND_HALF for where halfway is.
     """
     spans = rep_spans(knee, lo=lo, hi=hi)
     tail = [v for v in knee[spans[-1][1] if spans else 0:] if v is not None]
-    final = bool(tail) and max(tail) >= hi and tail[-1] <= (lo + hi) / 2
+    final = bool(tail) and max(tail) >= hi and tail[-1] <= CHAIR_STAND_HALF
     return len(spans) + final, final
 
 
 def chair_stand_norm(age, sex):
     """Reference number of stands, or None if the age is unknown or outside the table."""
-    if age is None:
+    if age is None or sex not in ("female", "male"):
         return None
     for (low, high), (women, men) in CHAIR_STAND_NORMS.items():
         if low <= age <= high:
@@ -385,7 +394,8 @@ def demo():
     three = full[:90]                                      # 3 stands, ends seated at 90
     assert chair_stand_score(three) == (3, False)
     assert chair_stand_score(three + list(np.linspace(90, 40, 8))) == (4, True)
-    assert chair_stand_score(three + list(np.linspace(90, 55, 8))) == (3, False)
+    assert chair_stand_score(three + list(np.linspace(90, 55, 8))) == (4, True)  # 55 deg
+    assert chair_stand_score(three + list(np.linspace(90, 65, 8))) == (3, False)
     assert chair_stand_score(three + list(np.linspace(90, 5, 15))) == (4, False)
     assert chair_stand_score(list(np.linspace(90, 40, 8))) == (1, True)  # first rise
     assert chair_stand_score([None, None]) == (0, False)
@@ -400,6 +410,7 @@ def demo():
     assert chair_stand_norm(72, "male") == 15
     assert chair_stand_norm(30, "female") is None
     assert chair_stand_norm(None, "female") is None
+    assert chair_stand_norm(72, None) is None       # unknown sex is not "male"
 
     # Ratchet: a fast machine locks on tier 0 and never steps down.
     r = TierRatchet(2, budget_ms=40.0)

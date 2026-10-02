@@ -39,6 +39,9 @@ MODEL_DIR = Path.home() / ".cache" / "rehapose"
 LEGACY_SESSIONS = MODEL_DIR / "sessions"
 MIN_COVERAGE = 80.0   # below this a row is not reported as a measurement
 AGE_UNSET = 17        # the age spinbox's "not entered" value, shown as "age ?"
+SEX_UNSET = "sex ?"
+SETUP_HOLD = 10       # consecutive good frames before the clock starts: one lucky frame
+                      # of z noise must not start a session on a bad camera position
 TIPS = ("Stand side-on to the camera, with your whole body in frame.\n\n"
         "Good light in front of you, not behind. Clothing that shows your\n"
         "knees and hips reads better than loose trousers.\n\n"
@@ -417,6 +420,7 @@ class Main(QtWidgets.QMainWindow):
             self.sounds[name].setSource(QtCore.QUrl.fromLocalFile(str(
                 make_beep(MODEL_DIR / f"tone-{freq}-{ms}.wav", freq, ms))))
         self.counted = None     # last countdown number shown, None outside a countdown
+        self.good_run = 0       # consecutive frames with a good setup
         self.time_called = self.final_counted = False
         self.setWindowTitle("rehaPose")
         self.resize(1500, 820)
@@ -451,10 +455,10 @@ class Main(QtWidgets.QMainWindow):
         self.age = QtWidgets.QSpinBox()
         self.age.setRange(AGE_UNSET, 99)
         self.age.setSpecialValueText("age ?")
-        self.age.setValue(70)
+        self.age.setValue(AGE_UNSET)
         self.age.setPrefix("age ")
         self.sex = QtWidgets.QComboBox()
-        self.sex.addItems(["female", "male"])
+        self.sex.addItems([SEX_UNSET, "female", "male"])
         self.cue = QtWidgets.QCheckBox("Beep on rep")
         self.cue.setChecked(True)
 
@@ -557,8 +561,10 @@ class Main(QtWidgets.QMainWindow):
         index = self.exercise.findData(key)
         if index >= 0:
             self.exercise.setCurrentIndex(index)
-        self.age.setValue(s.value("age", 70, type=int))
-        self.sex.setCurrentText(s.value("sex", "female", type=str))
+        # Unset unless someone entered it: a default of 70 got a real norm printed
+        # beside the count of a person whose age nobody had typed in.
+        self.age.setValue(s.value("age", AGE_UNSET, type=int))
+        self.sex.setCurrentText(s.value("sex", SEX_UNSET, type=str))
         self.person.setText(s.value("person", "", type=str))
         self.last_person = self.person.text().strip()
         self.cue.setChecked(s.value("beep", True, type=bool))
@@ -706,12 +712,15 @@ class Main(QtWidgets.QMainWindow):
         self.pages.setCurrentIndex(0)
         line = f"Showing {path.name} (stored). Press Start for a new session."
         if head.get("stands"):
-            reference = head.get("reference") or "no published reference for this age"
             if head.get("complete") == "no":
-                reference = "none shown - the test was stopped before 30 s"
-            line = (f"Chair stands: {head['stands']}.  Reference for an independent "
-                    f"{head.get('sex', '?')} aged {head.get('age', '?')}: {reference}.  "
-                    + line)
+                reference = "No reference shown - the test was stopped before 30 s."
+            elif not head.get("age") or not head.get("sex"):
+                reference = "Age or sex not entered, so no reference is shown."
+            else:
+                reference = (f"Reference for an independent {head['sex']} aged "
+                             f"{head['age']}: "
+                             f"{head.get('reference') or 'none published for this age'}.")
+            line = f"Chair stands: {head['stands']}.  {reference}  {line}"
         self.status.setText(line)
         self._sync()
 
@@ -728,10 +737,11 @@ class Main(QtWidgets.QMainWindow):
             self.sex.setCurrentText(str(known[1]))
         else:
             self.age.setValue(AGE_UNSET)        # ask, rather than inherit
+            self.sex.setCurrentText(SEX_UNSET)
 
     def remember_person(self):
         rec = self.recorded
-        if rec["person"] and rec["age"] is not None:
+        if rec["person"] and rec["age"] is not None and rec["sex"] is not None:
             people = dict(settings().value("people") or {})
             people[rec["person"]] = [rec["age"], rec["sex"]]
             settings().setValue("people", people)
@@ -759,7 +769,8 @@ class Main(QtWidgets.QMainWindow):
         self.recorded = {"exercise": self.exercise_key, "chair": self.chair_mode,
                          "person": self.person.text().strip(),
                          "age": None if age == AGE_UNSET else age,
-                         "sex": self.sex.currentText()}
+                         "sex": None if self.sex.currentText() == SEX_UNSET
+                         else self.sex.currentText()}
 
     def confirm_discard(self):
         """True if it is fine to drop the current session. Only asks when the autosave
@@ -793,7 +804,7 @@ class Main(QtWidgets.QMainWindow):
         self.filters = {j: OneEuro() for j in JOINTS}
         self.stands, self.stand_count = [], 0
         self.counted, self.time_called, self.final_counted = None, False, False
-        self.clock_start, self.setup_ok, self.frames = None, 0, 0
+        self.clock_start, self.setup_ok, self.frames, self.good_run = None, 0, 0, 0
         self.summaries, self.viewing_stored = {}, None
         self.on_person_changed()     # Cmd+R from inside the field skips editingFinished
         self._snapshot()
@@ -871,7 +882,7 @@ class Main(QtWidgets.QMainWindow):
         QtWidgets.QMessageBox.critical(self, "rehaPose", message)
 
     def gate(self, pixel, world, frame):
-        """(ok, hint). Starts the measurement clock the first time setup is good.
+        """(ok, hint). Starts the clock once setup has held for SETUP_HOLD frames.
 
         The clock deliberately does not start at the button press: otherwise the 30 s
         expires while the patient is still walking into frame, and a free session's
@@ -879,7 +890,8 @@ class Main(QtWidgets.QMainWindow):
         """
         h, w = frame.shape[:2]
         ok, hint = setup_check(pixel, world, w, h)
-        if ok and self.clock_start is None:
+        self.good_run = self.good_run + 1 if ok else 0
+        if self.clock_start is None and self.good_run >= SETUP_HOLD:
             lead = COUNTDOWN_S if self.recorded["chair"] else 0
             self.clock_start = time.perf_counter() + lead
             self.t0 = self.clock_start
@@ -1028,7 +1040,8 @@ class Main(QtWidgets.QMainWindow):
             norm = chair_stand_norm(rec["age"], rec["sex"])
             reference = (f"Reference for an independent {rec['sex']} aged "
                          f"{rec['age']}: {norm}." if norm else
-                         "Age not entered, so no reference is shown." if rec["age"] is None
+                         "Age or sex not entered, so no reference is shown."
+                         if rec["age"] is None or rec["sex"] is None
                          else "No published reference for this age.")
             if not self.time_called:
                 # A count from a test stopped at 12 s is not comparable to a 30 s norm,
@@ -1083,7 +1096,7 @@ class Main(QtWidgets.QMainWindow):
                 writer.writerow(["stands", self.stand_count,
                                  "complete", "yes" if self.time_called else "no"])
                 writer.writerow(["age", "" if rec["age"] is None else rec["age"],
-                                 "sex", rec["sex"]])
+                                 "sex", rec["sex"] or ""])
                 writer.writerow(["reference", chair_stand_norm(rec["age"], rec["sex"])])
             framing = 100.0 * self.setup_ok / max(self.frames, 1)
             writer.writerow(["framing_good_pct", f"{framing:.1f}"])
