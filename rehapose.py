@@ -13,6 +13,7 @@ import datetime
 import hashlib
 import importlib.metadata
 import math
+import os
 import shutil
 import struct
 import sys
@@ -86,6 +87,10 @@ def choose_data_dir(parent):
          "saved and never leaves this machine."))
     picked = QtWidgets.QFileDialog.getExistingDirectory(
         parent, "Keep sessions in", str(default.parent))
+    if not picked and previous:
+        # Cancelled while the old folder is missing: keep pointing at it. Falling back to
+        # Documents here would silently split sessions across two folders for good.
+        return None
     root = Path(picked) if picked else default
     try:
         root.mkdir(parents=True, exist_ok=True)
@@ -110,9 +115,19 @@ def migrate_legacy(target):
     moved = 0
     for old in LEGACY_SESSIONS.glob("*.csv"):
         new = target / old.name
-        if not new.exists():
-            shutil.move(old, new)   # rename() fails when the target is another volume
-            moved += 1
+        if new.exists():
+            continue
+        # Copy to a side name, then swap in atomically: rename() fails across volumes,
+        # and shutil.move() can leave a truncated file under the real name that the
+        # exists() check above would then skip forever.
+        part = new.with_name(new.name + ".part")
+        try:
+            shutil.copy2(old, part)
+            os.replace(part, new)
+        finally:
+            part.unlink(missing_ok=True)
+        old.unlink()
+        moved += 1
     return moved
 
 
@@ -135,15 +150,20 @@ COUNTDOWN_S = 3     # before a scored test, so its 30 s starts on a signal, not 
 TONES = {"rep": (880, 90), "tick": (660, 120), "go": (1320, 350), "end": (440, 700)}
 
 
+def md5_of(path):
+    return base64.b64encode(hashlib.md5(path.read_bytes()).digest()).decode()
+
+
 def ensure_model(tier):
     MODEL_DIR.mkdir(parents=True, exist_ok=True)
     path = MODEL_DIR / f"pose_landmarker_{tier}.task"
+    if path.exists() and md5_of(path) != MODEL_MD5[tier]:
+        path.unlink()       # cached before the pin, or damaged: fetch the pinned one
     if not path.exists():
         url = MODEL_URL.format(t=tier)
         tmp = path.with_suffix(".part")
         urllib.request.urlretrieve(url, tmp)
-        digest = base64.b64encode(hashlib.md5(tmp.read_bytes()).digest()).decode()
-        if digest != MODEL_MD5[tier]:
+        if md5_of(tmp) != MODEL_MD5[tier]:
             tmp.unlink()
             raise RuntimeError(f"The {tier} model download was corrupted - try Start again.")
         tmp.rename(path)
@@ -167,11 +187,9 @@ class PoseWorker(QtCore.QThread):
     def stop(self):
         self._stop = True
 
-    def _make(self, tier):
+    def _make(self, path):
         from mediapipe.tasks import python as mpp
         from mediapipe.tasks.python import vision
-        self.status.emit(f"Loading {tier} model...")
-        path = ensure_model(tier)
         return vision.PoseLandmarker.create_from_options(
             vision.PoseLandmarkerOptions(
                 base_options=mpp.BaseOptions(model_asset_path=str(path)),
@@ -205,11 +223,16 @@ class PoseWorker(QtCore.QThread):
             self.failed.emit("mediapipe is not installed - see README")
             return
 
+        # Every tier up front, before the camera: a ratchet step-down must not stall the
+        # frame loop on a download while the measuring clock keeps running.
+        self.status.emit("Preparing models (the first run downloads about 36 MB)...")
+        models = {tier: ensure_model(tier) for tier in TIERS}
+
         cap = self._open_camera()
         if cap is None:
             return
 
-        landmarker = self._make(TIERS[0])
+        landmarker = self._make(models[TIERS[0]])
         self.status.emit(f"Backend: MediaPipe {TIERS[0]}")
         ratchet = TierRatchet(len(TIERS), budget_ms=BUDGET_MS, window_s=RATCHET_S)
         stamp, misses = 0, 0
@@ -248,7 +271,7 @@ class PoseWorker(QtCore.QThread):
                 tier = ratchet.update(dt, time.perf_counter(), world is not None)
                 if tier is not None:
                     landmarker.close()
-                    landmarker = self._make(TIERS[tier])
+                    landmarker = self._make(models[TIERS[tier]])
                     self.tier = TIERS[tier]
                     self.status.emit(
                         f"Backend: MediaPipe {TIERS[tier]} (auto: too slow for "
@@ -293,13 +316,18 @@ def stamp_of(path):
         return path.stem
 
 
+def is_blank(row):
+    # A spreadsheet re-save pads blank rows with commas out to the used width.
+    return not any(cell.strip() for cell in row)
+
+
 def read_header(path):
     """Block 1 of a session file as a dict. Files are written with csv.writer, so they
     must be read back with csv.reader on newline="" - the line endings are CRLF."""
     head = {}
     with open(path, newline="", encoding="utf-8-sig", errors="replace") as handle:
         for row in csv.reader(handle):
-            if not row:
+            if is_blank(row):
                 break
             if len(row) >= 2:
                 head[row[0]] = row[1]
@@ -313,7 +341,7 @@ def read_joints(path):
     rows, section, header = {}, 0, None
     with open(path, newline="", encoding="utf-8-sig", errors="replace") as handle:
         for row in csv.reader(handle):
-            if not row:
+            if is_blank(row):
                 section += 1
                 continue
             if section == 1:
@@ -981,7 +1009,10 @@ class Main(QtWidgets.QMainWindow):
         if target is None:
             raise OSError("the sessions folder is not available")
         stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-        path = target / f"{stamp}-{self.recorded['exercise']}.csv"
+        key = self.recorded["exercise"]
+        path, n = target / f"{stamp}-{key}.csv", 2
+        while path.exists():           # two stops in one second must not overwrite
+            path, n = target / f"{stamp}-{key}-{n}.csv", n + 1
         self.write_csv(path)
         return path
 

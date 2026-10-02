@@ -214,6 +214,9 @@ class FakeWorker:
         return True
 
 
+real_session_dir = rehapose.session_dir
+
+
 def check_shell(window, tmp, frame, poses):
     """The app shell: state machine, menus, history round-trip, junk-session guard."""
     # Modal dialogs block forever offscreen, so silence them for the duration.
@@ -288,6 +291,19 @@ def check_shell(window, tmp, frame, poses):
             assert abs(stored[joint][field] - live[field]) <= 0.05, (joint, field)
         assert stored[joint]["reps"] == live["reps"], joint
 
+    # Two stops in the same second must give two files, not one overwritten.
+    twin = window.autosave()
+    assert twin != saved and twin.exists() and saved.exists(), (saved, twin)
+    twin.unlink()
+
+    # Excel and Numbers pad blank rows with commas; the blocks must still split.
+    padded = saved.with_name("20200104-000000-knee_flexion.csv")
+    raw = saved.read_bytes().replace(b"\r\n\r\n", b"\r\n,,,,,\r\n")
+    assert raw.count(b"\r\n,,,,,\r\n") == 2, "test did not pad anything"
+    padded.write_bytes(raw)
+    assert rehapose.stored_summaries(padded) == stored, "padded blank rows broke the reader"
+    padded.unlink()
+
     # A spreadsheet re-save in a legacy encoding, and a file that is not a session at
     # all, must each cost one row - not the whole History page.
     mangled = saved.with_name("20200101-000000-knee_flexion.csv")
@@ -344,6 +360,32 @@ def check_shell(window, tmp, frame, poses):
     window.person.setText("AB")
     window.on_person_changed()
     assert window.age.value() == 72, "known person's age was not restored"
+
+    # Legacy sessions move across whole, leaving no half-copied file behind.
+    legacy = pathlib.Path(tmp) / "legacy"
+    legacy.mkdir()
+    (legacy / "20250101-000000-free.csv").write_text("exercise,free\r\n")
+    real_legacy, rehapose.LEGACY_SESSIONS = rehapose.LEGACY_SESSIONS, legacy
+    target = pathlib.Path(tmp) / "migrated"
+    assert rehapose.migrate_legacy(target) == 1
+    assert [f.name for f in target.iterdir()] == ["20250101-000000-free.csv"]
+    assert not list(legacy.iterdir()), "legacy original left behind"
+    rehapose.LEGACY_SESSIONS = real_legacy
+
+    # The sessions folder went missing and the picker was cancelled: keep the old
+    # folder rather than silently starting a second one in Documents.
+    missing = str(pathlib.Path(tmp) / "unplugged-drive")
+    rehapose.settings().setValue("dataDir", missing)
+    picker = QtWidgets.QFileDialog.getExistingDirectory
+    QtWidgets.QFileDialog.getExistingDirectory = staticmethod(lambda *_a, **_k: "")
+    rehapose.session_dir = lambda: None          # the drive is not there
+    try:
+        assert rehapose.choose_data_dir(window) is None
+        assert rehapose.settings().value("dataDir", type=str) == missing
+    finally:
+        QtWidgets.QFileDialog.getExistingDirectory = picker
+        rehapose.session_dir = real_session_dir
+        rehapose.settings().setValue("dataDir", tmp)
 
     # Settings round-trip, so the app reopens the way it was left.
     window.age.setValue(81)
