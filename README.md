@@ -247,5 +247,5 @@ radon cc -s -a *.py                                 # complexity
 | `capture.py` | Camera thread, tier ratchet wiring, pinned model download and hash check |
 | `test_rehapose.py` | Headless smoke test |
 | `mirror_check.py` | Mirror-consistency measurement over a recorded clip, per model tier |
-| `.github/workflows/checks.yml` | CI: lint, self-check and smoke test on macOS arm64 |
+| `.github/workflows/checks.yml` | CI: lint, self-check and smoke test on macOS arm64 and Ubuntu x64 |
 | `Body_Joint.py` | The original MMPose version. Kept as reference; does not run — see above |
