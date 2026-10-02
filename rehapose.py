@@ -6,21 +6,13 @@ right, Start/Stop underneath, and a results table when you stop.
     python rehapose.py [--camera N]
 """
 import argparse
-import base64
 import contextlib
 import csv
-import datetime
-import hashlib
-import importlib.metadata
 import math
-import os
-import shutil
 import struct
 import sys
 import time
-import urllib.request
 import wave
-from pathlib import Path
 
 import cv2
 import numpy as np
@@ -29,14 +21,13 @@ from PyQt5 import QtCore, QtGui, QtMultimedia, QtWidgets, sip
 
 from analysis import (CHAIR_STAND_HI, CHAIR_STAND_LO, CHAIR_STAND_SECONDS,
                       CONNECTIONS, EXERCISE_DISPLAY, EXERCISES, JOINTS, OneEuro,
-                      TierRatchet, chair_stand_norm, chair_stand_score, count_reps,
+                      chair_stand_norm, chair_stand_score, count_reps,
                       flexion, setup_check, summarize, visible)
+from capture import MODEL_DIR, PoseWorker, mediapipe_version
+from storage import (choose_data_dir, new_session_path, read_header, session_dir,
+                     settings, stamp_of, stored_summaries, write_session)
 
 VERSION = "0.2"
-# The model cache stays in ~/.cache - it is re-downloadable, which is what a cache is
-# for. Sessions are the user's only copy and live wherever they chose on first run.
-MODEL_DIR = Path.home() / ".cache" / "rehapose"
-LEGACY_SESSIONS = MODEL_DIR / "sessions"
 MIN_COVERAGE = 80.0   # below this a row is not reported as a measurement
 AGE_UNSET = 17        # the age spinbox's "not entered" value, shown as "age ?"
 SEX_UNSET = "sex ?"
@@ -48,248 +39,10 @@ TIPS = ("Stand side-on to the camera, with your whole body in frame.\n\n"
         "Recording starts once the framing is right, not when you press Start.")
 
 
-def settings():
-    # No arguments: resolve from the QApplication's organization/application names.
-    # Hardcoding ("rehaPose", "rehaPose") here made the smoke test's "rehaPoseTest"
-    # name a no-op, so every test run pointed the REAL dataDir at a temp folder.
-    return QtCore.QSettings()
-
-
-def session_dir():
-    """Where sessions live, or None if not chosen yet or no longer reachable."""
-    chosen = settings().value("dataDir", "", type=str)
-    if not chosen:
-        return None
-    path = Path(chosen) / "sessions"
-    try:
-        path.mkdir(parents=True, exist_ok=True)
-    except OSError:
-        return None   # unplugged drive, revoked permission, or the folder became a file
-    return path
-
-
-def choose_data_dir(parent):
-    """First run: ask once where sessions should live, then remember it.
-
-    Asked rather than assumed because this is the user's only copy, and a folder they
-    cannot find is a folder they cannot back up or send to anyone.
-    """
-    existing = session_dir()
-    if existing is not None:
-        return existing
-    previous = settings().value("dataDir", "", type=str)
-    default = Path(QtCore.QStandardPaths.writableLocation(
-        QtCore.QStandardPaths.DocumentsLocation)) / "rehaPose"
-    QtWidgets.QMessageBox.information(
-        parent, "rehaPose",
-        (f"The sessions folder {previous} is not available - is a drive unplugged?\n\n"
-         "Choose where to keep sessions. Pick the same folder again once it is back."
-         if previous else
-         "Choose a folder to keep your sessions in.\n\n"
-         "Each session is a CSV you can open, back up or send on. Video is never "
-         "saved and never leaves this machine."))
-    picked = QtWidgets.QFileDialog.getExistingDirectory(
-        parent, "Keep sessions in", str(default.parent))
-    if not picked and previous:
-        # Cancelled while the old folder is missing: keep pointing at it. Falling back to
-        # Documents here would silently split sessions across two folders for good.
-        return None
-    root = Path(picked) if picked else default
-    try:
-        root.mkdir(parents=True, exist_ok=True)
-        (root / "sessions").mkdir(exist_ok=True)
-        moved = migrate_legacy(root / "sessions")
-    except OSError as exc:
-        QtWidgets.QMessageBox.warning(parent, "rehaPose",
-                                      f"Cannot keep sessions in {root}: {exc.strerror or exc}")
-        return None
-    settings().setValue("dataDir", str(root))
-    if moved:
-        QtWidgets.QMessageBox.information(
-            parent, "rehaPose", f"Moved {moved} earlier session(s) into {root}.")
-    return session_dir()
-
-
-def migrate_legacy(target):
-    """Sessions used to be written under ~/.cache, which the OS may delete."""
-    if not LEGACY_SESSIONS.is_dir():
-        return 0
-    target.mkdir(parents=True, exist_ok=True)
-    moved = 0
-    for old in LEGACY_SESSIONS.glob("*.csv"):
-        new = target / old.name
-        if new.exists():
-            continue
-        # Copy to a side name, then swap in atomically: rename() fails across volumes,
-        # and shutil.move() can leave a truncated file under the real name that the
-        # exists() check above would then skip forever.
-        part = new.with_name(new.name + ".part")
-        try:
-            shutil.copy2(old, part)
-            os.replace(part, new)
-        finally:
-            part.unlink(missing_ok=True)
-        old.unlink()
-        moved += 1
-    return moved
-
-
-# Version 1, not "latest": the tiers already differ by up to ~50 deg on one elbow, so a
-# model that changes underneath a repeatability run makes the run meaningless. The MD5s
-# are the bucket's own x-goog-hash for these exact objects (identical to "latest" as of
-# 2026-10-02), so a truncated or swapped download is refused rather than trusted.
-MODEL_URL = ("https://storage.googleapis.com/mediapipe-models/pose_landmarker/"
-             "pose_landmarker_{t}/float16/1/pose_landmarker_{t}.task")
-MODEL_MD5 = {"heavy": "RT3sTQLMxNPOgStt6E+lFg==", "lite": "BKdd33yBGsehpFIyZt19iA=="}
-
-# Two tiers, not three: the ratchet's only real question is "can this machine sustain
-# heavy, yes or no". Measured on an M4: heavy 16.2 ms, lite 6.5 ms.
-TIERS = ("heavy", "lite")
-BUDGET_MS = 40.0    # 25 fps of inference, leaving room for camera + plots
-RATCHET_S = 5.0     # after this many seconds of *detected pose*, the tier is locked
 LIVE_WINDOW_S = 20.0
 COUNTDOWN_S = 3     # before a scored test, so its 30 s starts on a signal, not on framing
 # (Hz, ms). Distinct pitches so "go" and "time" are unmistakable without looking.
 TONES = {"rep": (880, 90), "tick": (660, 120), "go": (1320, 350), "end": (440, 700)}
-
-
-def md5_of(path):
-    return base64.b64encode(hashlib.md5(path.read_bytes()).digest()).decode()
-
-
-def ensure_model(tier):
-    MODEL_DIR.mkdir(parents=True, exist_ok=True)
-    path = MODEL_DIR / f"pose_landmarker_{tier}.task"
-    if path.exists() and md5_of(path) != MODEL_MD5[tier]:
-        path.unlink()       # cached before the pin, or damaged: fetch the pinned one
-    if not path.exists():
-        url = MODEL_URL.format(t=tier)
-        tmp = path.with_suffix(".part")
-        urllib.request.urlretrieve(url, tmp)
-        if md5_of(tmp) != MODEL_MD5[tier]:
-            tmp.unlink()
-            raise RuntimeError(f"The {tier} model download was corrupted - try Start again.")
-        tmp.rename(path)
-    return path
-
-
-class PoseWorker(QtCore.QThread):
-    """Camera capture + inference, off the GUI thread so the UI never stalls."""
-
-    # bgr frame, (pixel, world) - each None when no pose was found, inference ms
-    ready = QtCore.pyqtSignal(object, object, float)
-    status = QtCore.pyqtSignal(str)
-    failed = QtCore.pyqtSignal(str)
-
-    def __init__(self, camera=0):
-        super().__init__()
-        self.camera = camera
-        self.tier_log = [TIERS[0]]     # every tier this session ran on, in order
-        self._stop = False
-
-    def stop(self):
-        self._stop = True
-
-    def _make(self, path):
-        from mediapipe.tasks import python as mpp
-        from mediapipe.tasks.python import vision
-        return vision.PoseLandmarker.create_from_options(
-            vision.PoseLandmarkerOptions(
-                base_options=mpp.BaseOptions(model_asset_path=str(path)),
-                running_mode=vision.RunningMode.VIDEO,
-                num_poses=1))
-
-    def _open_camera(self):
-        cap = cv2.VideoCapture(self.camera)
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        if not cap.isOpened():
-            self.failed.emit(f"Could not open camera {self.camera}. Try --camera 1.")
-            return None
-        return cap
-
-    def run(self):
-        # An unhandled exception in QThread.run does not raise into Qt - PyQt5 takes the
-        # qFatal path and the whole process dies with SIGABRT. A first run with no
-        # network reaches ensure_model() below, so without this the app simply
-        # disappears. Reproduced: exit 134.
-        try:
-            self._run()
-        except Exception as exc:                                  # noqa: BLE001
-            self.failed.emit(f"{type(exc).__name__}: {exc}")
-
-    def _run(self):
-        try:
-            import mediapipe as mp
-        except ImportError:
-            self.failed.emit("mediapipe is not installed - see README")
-            return
-
-        # Every tier up front, before the camera: a ratchet step-down must not stall the
-        # frame loop on a download while the measuring clock keeps running.
-        self.status.emit("Preparing models (the first run downloads about 36 MB)...")
-        models = {tier: ensure_model(tier) for tier in TIERS}
-
-        cap = self._open_camera()
-        if cap is None:
-            return
-
-        landmarker = self._make(models[TIERS[0]])
-        self.status.emit(f"Backend: MediaPipe {TIERS[0]}")
-        ratchet = TierRatchet(len(TIERS), budget_ms=BUDGET_MS, window_s=RATCHET_S)
-        stamp, misses = 0, 0
-
-        try:
-            while not self._stop:
-                ok, frame = cap.read()
-                if not ok:
-                    # A denied macOS camera permission opens the device but never
-                    # yields a frame, so "keep retrying" would spin in silence forever.
-                    misses += 1
-                    if misses > 60:
-                        self.failed.emit(
-                            f"Camera {self.camera} opened but returned no frames. On macOS, "
-                            "grant camera access to your terminal in System Settings > "
-                            "Privacy & Security > Camera, then Start again.")
-                        return
-                    self.msleep(50)
-                    continue
-                misses = 0
-                # Inference runs on the UNFLIPPED frame: MediaPipe infers anatomical
-                # left/right from the image, so mirroring first silently swaps every
-                # left_* and right_* label. Mirroring happens at display time instead.
-                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-
-                stamp += 33
-                t0 = time.perf_counter()
-                res = landmarker.detect_for_video(image, stamp)
-                dt = (time.perf_counter() - t0) * 1000.0
-
-                world = res.pose_world_landmarks[0] if res.pose_world_landmarks else None
-                pixel = res.pose_landmarks[0] if res.pose_landmarks else None
-                self.ready.emit(frame, (pixel, world), dt)
-
-                tier = ratchet.update(dt, time.perf_counter(), world is not None)
-                if tier is not None:
-                    landmarker.close()
-                    landmarker = self._make(models[TIERS[tier]])
-                    self.tier_log.append(TIERS[tier])
-                    self.status.emit(
-                        f"Backend: MediaPipe {TIERS[tier]} (auto: too slow for "
-                        f"{TIERS[tier - 1]})")
-        finally:
-            cap.release()
-            with contextlib.suppress(Exception):
-                landmarker.close()
-
-
-def mediapipe_version():
-    try:
-        return importlib.metadata.version("mediapipe")
-    except importlib.metadata.PackageNotFoundError:
-        return ""
 
 
 def make_beep(path, freq=880.0, ms=90, rate=44100):
@@ -310,53 +63,6 @@ def make_beep(path, freq=880.0, ms=90, rate=44100):
     return path
 
 
-def stamp_of(path):
-    """Display date from the filename, which is where the timestamp already lives."""
-    try:
-        return datetime.datetime.strptime(path.name[:15], "%Y%m%d-%H%M%S").strftime(
-            "%Y-%m-%d %H:%M")
-    except ValueError:
-        return path.stem
-
-
-def is_blank(row):
-    # A spreadsheet re-save pads blank rows with commas out to the used width.
-    return not any(cell.strip() for cell in row)
-
-
-def read_header(path):
-    """Block 1 of a session file as a dict. Files are written with csv.writer, so they
-    must be read back with csv.reader on newline="" - the line endings are CRLF."""
-    head = {}
-    with open(path, newline="", encoding="utf-8-sig", errors="replace") as handle:
-        for row in csv.reader(handle):
-            if is_blank(row):
-                break
-            if len(row) >= 2:
-                head[row[0]] = row[1]
-            if len(row) >= 4:
-                head[row[2]] = row[3]
-    return head
-
-
-def read_joints(path):
-    """Block 2 of a session file: {joint: {column: value}}."""
-    rows, section, header = {}, 0, None
-    with open(path, newline="", encoding="utf-8-sig", errors="replace") as handle:
-        for row in csv.reader(handle):
-            if is_blank(row):
-                section += 1
-                continue
-            if section == 1:
-                if row[0] == "joint":
-                    header = row
-                    continue
-                if header is None:
-                    raise ValueError("per-joint block has no header row")
-                rows[row[0]] = dict(zip(header[1:], row[1:], strict=False))
-    return rows
-
-
 def big_text(frame, text):
     """Large outlined text in the top-left corner - drawn AFTER the mirror flip, or it
     reads backwards."""
@@ -366,15 +72,6 @@ def big_text(frame, text):
         cv2.putText(frame, text, org, cv2.FONT_HERSHEY_SIMPLEX, scale, color, width,
                     cv2.LINE_AA)
     return frame
-
-
-def stored_summaries(path):
-    """Block 2 in the shape summarize() returns, so one renderer serves live and stored.
-    Raises ValueError/KeyError on a file that has been edited out of shape."""
-    return {joint: {"rom": float(v["rom_deg"]), "peak": float(v["peak_deg"]),
-                    "min": float(v["min_deg"]), "reps": int(v["reps"]),
-                    "coverage": float(v["tracked_pct"])}
-            for joint, v in read_joints(path).items()}
 
 
 def draw_overlay(frame, pixel, angles):
@@ -1064,16 +761,14 @@ class Main(QtWidgets.QMainWindow):
         target = session_dir()
         if target is None:
             raise OSError("the sessions folder is not available")
-        stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-        key = self.recorded["exercise"]
-        path, n = target / f"{stamp}-{key}.csv", 2
-        while path.exists():           # two stops in one second must not overwrite
-            path, n = target / f"{stamp}-{key}-{n}.csv", n + 1
+        path = new_session_path(target, self.recorded["exercise"])
         self.write_csv(path)
         return path
 
     def write_csv(self, path):
-        joints = list(JOINTS)
+        write_session(path, self.session_header(), self.summaries, self.times, self.angles)
+
+    def session_header(self):
         reported = {j: s for j, s in self.summaries.items() if s["coverage"] >= MIN_COVERAGE}
         # Named, because the largest ROM of eight joints is often not the joint the
         # exercise is about - on a knee session it can be the elbow, the noisiest one.
@@ -1081,40 +776,24 @@ class Main(QtWidgets.QMainWindow):
         best = reported[best_joint]["rom"] if best_joint else 0.0
         duration = max((t[-1] for t in self.times.values() if t), default=0.0)
         rec = self.recorded
-        # utf-8-sig: the BOM is what makes Excel show the degree sign instead of mojibake.
-        with open(path, "w", newline="", encoding="utf-8-sig") as handle:
-            writer = csv.writer(handle)
+        rows = [
             # The KEY, never the display text: History shows this, and renaming a
             # label must not orphan every session recorded before the rename.
-            writer.writerow(["exercise", rec["exercise"], "person", rec["person"]])
-            writer.writerow(["duration_s", f"{duration:.0f}"])
+            ["exercise", rec["exercise"], "person", rec["person"]],
+            ["duration_s", f"{duration:.0f}"],
             # Provenance, so a later analysis can tell which model produced which angles.
-            writer.writerow(["app_version", VERSION, "model", self.model_tier])
-            writer.writerow(["mediapipe", mediapipe_version()])
-            writer.writerow(["best_rom", f"{best:.0f}°", "best_joint", best_joint])
-            if rec["chair"]:
-                writer.writerow(["stands", self.stand_count,
-                                 "complete", "yes" if self.time_called else "no"])
-                writer.writerow(["age", "" if rec["age"] is None else rec["age"],
-                                 "sex", rec["sex"] or ""])
-                writer.writerow(["reference", chair_stand_norm(rec["age"], rec["sex"])])
-            framing = 100.0 * self.setup_ok / max(self.frames, 1)
-            writer.writerow(["framing_good_pct", f"{framing:.1f}"])
-            writer.writerow([])
-            writer.writerow(["joint", "rom_deg", "peak_deg", "min_deg", "reps", "tracked_pct"])
-            for joint in joints:
-                s = self.summaries[joint]
-                writer.writerow([joint, f"{s['rom']:.1f}", f"{s['peak']:.1f}",
-                                 f"{s['min']:.1f}", s["reps"], f"{s['coverage']:.1f}"])
-            writer.writerow([])
-            writer.writerow(["time_s"] + joints)
-            times = self.times[joints[0]]
-            for i, t in enumerate(times):
-                row = [f"{t:.3f}"]
-                for joint in joints:
-                    v = self.angles[joint][i]
-                    row.append("" if v is None else f"{v:.2f}")
-                writer.writerow(row)
+            ["app_version", VERSION, "model", self.model_tier],
+            ["mediapipe", mediapipe_version()],
+            ["best_rom", f"{best:.0f}°", "best_joint", best_joint],
+        ]
+        if rec["chair"]:
+            rows += [
+                ["stands", self.stand_count, "complete", "yes" if self.time_called else "no"],
+                ["age", "" if rec["age"] is None else rec["age"], "sex", rec["sex"] or ""],
+                ["reference", chair_stand_norm(rec["age"], rec["sex"])],
+            ]
+        framing = 100.0 * self.setup_ok / max(self.frames, 1)
+        return rows + [["framing_good_pct", f"{framing:.1f}"]]
 
     def save_csv(self):
         path, _ = QtWidgets.QFileDialog.getSaveFileName(

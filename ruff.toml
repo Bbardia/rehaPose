@@ -1,6 +1,6 @@
 # Reproduce the checks the code is kept clean against:
 #   ruff check .
-#   radon cc -s -a rehapose.py analysis.py
+#   radon cc -s -a *.py && radon mi -s *.py
 line-length = 100
 exclude = ["Body_Joint.py"]   # kept as a historical reference; not maintained
 

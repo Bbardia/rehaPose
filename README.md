@@ -232,15 +232,17 @@ python analysis.py                                  # angle, filter, rep-span, r
 QT_QPA_PLATFORM=offscreen python test_rehapose.py   # real landmarks through the real UI
 ruff check .                                        # lint (config in ruff.toml)
 python mirror_check.py clip.mp4                     # mirror consistency on a real clip
-radon cc -s -a rehapose.py analysis.py              # complexity
+radon cc -s -a *.py                                 # complexity
 ```
 
 ## Files
 
 | File | What |
 |---|---|
-| `rehapose.py` | The app: camera thread, tier ratchet, Qt UI, menus, history, autosave |
+| `rehapose.py` | The app: Qt UI, menus, history, autosave, chair-stand flow |
 | `analysis.py` | Angles, filter, rep spans, setup check, exercises, norms. No Qt, no camera |
+| `storage.py` | Sessions folder, legacy migration, the session file format and its readers |
+| `capture.py` | Camera thread, tier ratchet wiring, pinned model download and hash check |
 | `test_rehapose.py` | Headless smoke test |
 | `mirror_check.py` | Mirror-consistency measurement over a recorded clip, per model tier |
 | `.github/workflows/checks.yml` | CI: lint, self-check and smoke test on macOS arm64 |

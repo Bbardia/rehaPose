@@ -17,7 +17,9 @@ import numpy as np
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import analysis
+import capture
 import rehapose
+import storage
 from analysis import JOINTS
 from PyQt5 import QtCore, QtWidgets
 
@@ -79,7 +81,7 @@ def run(app, tmp):
     from mediapipe.tasks import python as mpp
     from mediapipe.tasks.python import vision
 
-    path = rehapose.ensure_model("lite")
+    path = capture.ensure_model("lite")
     landmarker = vision.PoseLandmarker.create_from_options(
         vision.PoseLandmarkerOptions(
             base_options=mpp.BaseOptions(model_asset_path=str(path)),
@@ -111,7 +113,7 @@ def run(app, tmp):
     for image_bgr in (frame, cv2.flip(frame, 1)):
         heavy = vision.PoseLandmarker.create_from_options(
             vision.PoseLandmarkerOptions(
-                base_options=mpp.BaseOptions(model_asset_path=str(rehapose.ensure_model(
+                base_options=mpp.BaseOptions(model_asset_path=str(capture.ensure_model(
                     "heavy"))), running_mode=vision.RunningMode.VIDEO, num_poses=1))
         still = mp.Image(image_format=mp.ImageFormat.SRGB,
                          data=cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB))
@@ -228,7 +230,7 @@ def check_chair_stand(window, app, frame, poses):
     assert window.stand_count == 4 and window.final_counted, window.stand_count
     assert "more than halfway" in window.status.text(), window.status.text()
     saved = sorted(rehapose.session_dir().glob("*-chair_stand_30s.csv"))[-1]
-    head = rehapose.read_header(saved)
+    head = storage.read_header(saved)
     assert head["stands"] == "4" and head["complete"] == "yes", head
 
     # And History brings the stand count back, not just the joint table.
@@ -241,7 +243,7 @@ def check_chair_stand(window, app, frame, poses):
     # Stopped by hand: the file, History and the stored view must all say so.
     window.viewing_stored, window.time_called = None, False
     saved = window.autosave()
-    assert rehapose.read_header(saved)["complete"] == "no"
+    assert storage.read_header(saved)["complete"] == "no"
     window.show_history()
     assert "(stopped early)" in window.sessions.item(0, 4).text()
     window.open_stored(window.sessions.item(0, 0))
@@ -262,7 +264,7 @@ class FakeWorker:
         return True
 
 
-real_session_dir = rehapose.session_dir
+real_session_dir = storage.session_dir
 
 
 def check_shell(window, tmp, frame, poses):
@@ -340,7 +342,7 @@ def check_shell(window, tmp, frame, poses):
     saved = window.autosave()
     assert saved.name.endswith("-knee_flexion.csv"), saved.name
     window.exercise.setCurrentIndex(window.exercise.findData("knee_flexion"))
-    head = rehapose.read_header(saved)
+    head = storage.read_header(saved)
     assert head["exercise"] == "knee_flexion", head
     assert "duration_s" in head and "best_rom" in head, head
     assert head["best_joint"] in JOINTS, head
@@ -348,7 +350,7 @@ def check_shell(window, tmp, frame, poses):
     assert head["model"] == "lite", head            # from FakeWorker, via _detach
 
     # The file is the user's only copy: what it reads back must be what was shown.
-    stored = rehapose.stored_summaries(saved)
+    stored = storage.stored_summaries(saved)
     assert set(stored) == set(JOINTS), stored.keys()
     for joint, live in window.summaries.items():
         for field in ("rom", "peak", "min", "coverage"):
@@ -365,7 +367,7 @@ def check_shell(window, tmp, frame, poses):
     raw = saved.read_bytes().replace(b"\r\n\r\n", b"\r\n,,,,,\r\n")
     assert raw.count(b"\r\n,,,,,\r\n") == 2, "test did not pad anything"
     padded.write_bytes(raw)
-    assert rehapose.stored_summaries(padded) == stored, "padded blank rows broke the reader"
+    assert storage.stored_summaries(padded) == stored, "padded blank rows broke the reader"
     padded.unlink()
 
     # A spreadsheet re-save in a legacy encoding, and a file that is not a session at
@@ -423,7 +425,7 @@ def check_shell(window, tmp, frame, poses):
     window.recorded["chair"], window.time_called = True, True
     assert "not entered" in window.verdict(), window.verdict()
     saved = window.autosave()
-    head = rehapose.read_header(saved)
+    head = storage.read_header(saved)
     assert head["person"] == "CD" and head["age"] == "" and head["sex"] == "", head
     window.show_history()
     assert window.sessions.item(0, 1).text() == "CD"
@@ -437,12 +439,12 @@ def check_shell(window, tmp, frame, poses):
     legacy = pathlib.Path(tmp) / "legacy"
     legacy.mkdir()
     (legacy / "20250101-000000-free.csv").write_text("exercise,free\r\n")
-    real_legacy, rehapose.LEGACY_SESSIONS = rehapose.LEGACY_SESSIONS, legacy
+    real_legacy, storage.LEGACY_SESSIONS = storage.LEGACY_SESSIONS, legacy
     target = pathlib.Path(tmp) / "migrated"
-    assert rehapose.migrate_legacy(target) == 1
+    assert storage.migrate_legacy(target) == 1
     assert [f.name for f in target.iterdir()] == ["20250101-000000-free.csv"]
     assert not list(legacy.iterdir()), "legacy original left behind"
-    rehapose.LEGACY_SESSIONS = real_legacy
+    storage.LEGACY_SESSIONS = real_legacy
 
     # The sessions folder went missing and the picker was cancelled: keep the old
     # folder rather than silently starting a second one in Documents.
@@ -450,13 +452,13 @@ def check_shell(window, tmp, frame, poses):
     rehapose.settings().setValue("dataDir", missing)
     picker = QtWidgets.QFileDialog.getExistingDirectory
     QtWidgets.QFileDialog.getExistingDirectory = staticmethod(lambda *_a, **_k: "")
-    rehapose.session_dir = lambda: None          # the drive is not there
+    storage.session_dir = lambda: None          # the drive is not there
     try:
-        assert rehapose.choose_data_dir(window) is None
+        assert storage.choose_data_dir(window) is None
         assert rehapose.settings().value("dataDir", type=str) == missing
     finally:
         QtWidgets.QFileDialog.getExistingDirectory = picker
-        rehapose.session_dir = real_session_dir
+        storage.session_dir = real_session_dir
         rehapose.settings().setValue("dataDir", tmp)
 
     # Settings round-trip, so the app reopens the way it was left.

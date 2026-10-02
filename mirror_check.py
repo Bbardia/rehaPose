@@ -18,7 +18,7 @@ import cv2
 import numpy as np
 
 from analysis import JOINTS, flexion, visible
-from rehapose import TIERS, ensure_model
+from capture import TIERS, ensure_model
 
 
 def landmarker(tier):
