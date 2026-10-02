@@ -221,6 +221,8 @@ def check_shell(window, tmp, frame, poses):
     assert head["exercise"] == "knee_flexion", head
     assert "duration_s" in head and "best_rom" in head, head
     assert head["best_joint"] in JOINTS, head
+    assert head["app_version"] == rehapose.VERSION and head["mediapipe"] == "1.0.0", head
+    assert head["model"] == "lite", head            # from FakeWorker, via _detach
 
     # The file is the user's only copy: what it reads back must be what was shown.
     stored = rehapose.stored_summaries(saved)

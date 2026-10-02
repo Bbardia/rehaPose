@@ -6,9 +6,12 @@ right, Start/Stop underneath, and a results table when you stop.
     python rehapose.py [--camera N]
 """
 import argparse
+import base64
 import contextlib
 import csv
 import datetime
+import hashlib
+import importlib.metadata
 import math
 import shutil
 import struct
@@ -112,8 +115,13 @@ def migrate_legacy(target):
     return moved
 
 
+# Version 1, not "latest": the tiers already differ by up to ~50 deg on one elbow, so a
+# model that changes underneath a repeatability run makes the run meaningless. The MD5s
+# are the bucket's own x-goog-hash for these exact objects (identical to "latest" as of
+# 2026-10-02), so a truncated or swapped download is refused rather than trusted.
 MODEL_URL = ("https://storage.googleapis.com/mediapipe-models/pose_landmarker/"
-             "pose_landmarker_{t}/float16/latest/pose_landmarker_{t}.task")
+             "pose_landmarker_{t}/float16/1/pose_landmarker_{t}.task")
+MODEL_MD5 = {"heavy": "RT3sTQLMxNPOgStt6E+lFg==", "lite": "BKdd33yBGsehpFIyZt19iA=="}
 
 # Two tiers, not three: the ratchet's only real question is "can this machine sustain
 # heavy, yes or no". Measured on an M4: heavy 16.2 ms, lite 6.5 ms.
@@ -130,6 +138,10 @@ def ensure_model(tier):
         url = MODEL_URL.format(t=tier)
         tmp = path.with_suffix(".part")
         urllib.request.urlretrieve(url, tmp)
+        digest = base64.b64encode(hashlib.md5(tmp.read_bytes()).digest()).decode()
+        if digest != MODEL_MD5[tier]:
+            tmp.unlink()
+            raise RuntimeError(f"The {tier} model download was corrupted - try Start again.")
         tmp.rename(path)
     return path
 
@@ -244,6 +256,13 @@ class PoseWorker(QtCore.QThread):
             cap.release()
             with contextlib.suppress(Exception):
                 landmarker.close()
+
+
+def mediapipe_version():
+    try:
+        return importlib.metadata.version("mediapipe")
+    except importlib.metadata.PackageNotFoundError:
+        return ""
 
 
 def make_beep(path, freq=880.0, ms=90, rate=44100):
@@ -882,6 +901,9 @@ class Main(QtWidgets.QMainWindow):
             # label must not orphan every session recorded before the rename.
             writer.writerow(["exercise", rec["exercise"]])
             writer.writerow(["duration_s", f"{duration:.0f}"])
+            # Provenance, so a later analysis can tell which model produced which angles.
+            writer.writerow(["app_version", VERSION, "model", self.model_tier])
+            writer.writerow(["mediapipe", mediapipe_version()])
             writer.writerow(["best_rom", f"{best:.0f}°", "best_joint", best_joint])
             if rec["chair"]:
                 writer.writerow(["stands", self.stand_count])
