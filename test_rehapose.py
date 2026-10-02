@@ -220,12 +220,36 @@ def check_shell(window, tmp, frame, poses):
     head = rehapose.read_header(saved)
     assert head["exercise"] == "knee_flexion", head
     assert "duration_s" in head and "best_rom" in head, head
+    assert head["best_joint"] in JOINTS, head
+
+    # The file is the user's only copy: what it reads back must be what was shown.
+    stored = rehapose.stored_summaries(saved)
+    assert set(stored) == set(JOINTS), stored.keys()
+    for joint, live in window.summaries.items():
+        for field in ("rom", "peak", "min", "coverage"):
+            assert abs(stored[joint][field] - live[field]) <= 0.05, (joint, field)
+        assert stored[joint]["reps"] == live["reps"], joint
+
+    # A spreadsheet re-save in a legacy encoding, and a file that is not a session at
+    # all, must each cost one row - not the whole History page.
+    mangled = saved.with_name("20200101-000000-knee_flexion.csv")
+    mangled.write_bytes(saved.read_text(encoding="utf-8-sig").encode("cp1252"))
+    junk = saved.with_name("20200102-000000-other.csv")
+    junk.write_bytes(b"\x00\xff garbage\r\n\r\njoint\r\nleft_knee,notanumber\r\n")
 
     # History must read what autosave wrote, and round-trip it back into the results.
     window.show_history()
     assert window.pages.currentIndex() == 1
-    assert window.sessions.rowCount() == 1, window.sessions.rowCount()
+    assert window.sessions.rowCount() == 3, window.sessions.rowCount()
     assert window.sessions.item(0, 1).text() == "Knee flexion / extension"
+    assert head["best_joint"].replace("_", " ") in window.sessions.item(0, 3).text()
+    # The degree sign decodes as U+FFFD; the number, which is what matters, survives.
+    assert any(c.isdigit() for c in window.sessions.item(2, 3).text()), "cp1252 row lost"
+    window.open_stored(window.sessions.item(1, 0))      # junk: a warning, not a crash
+    assert window.viewing_stored is None
+    mangled.unlink()
+    junk.unlink()
+    window.show_history()
     window.open_stored(window.sessions.item(0, 0))
     assert window.pages.currentIndex() == 0 and window.stack.currentIndex() == 1
     # Viewing a stored session must not let Save a Copy write the live session over it.

@@ -289,7 +289,7 @@ def read_header(path):
 
 def read_joints(path):
     """Block 2 of a session file: {joint: {column: value}}."""
-    rows, section = {}, 0
+    rows, section, header = {}, 0, None
     with open(path, newline="", encoding="utf-8-sig", errors="replace") as handle:
         for row in csv.reader(handle):
             if not row:
@@ -299,8 +299,19 @@ def read_joints(path):
                 if row[0] == "joint":
                     header = row
                     continue
+                if header is None:
+                    raise ValueError("per-joint block has no header row")
                 rows[row[0]] = dict(zip(header[1:], row[1:], strict=False))
     return rows
+
+
+def stored_summaries(path):
+    """Block 2 in the shape summarize() returns, so one renderer serves live and stored.
+    Raises ValueError/KeyError on a file that has been edited out of shape."""
+    return {joint: {"rom": float(v["rom_deg"]), "peak": float(v["peak_deg"]),
+                    "min": float(v["min_deg"]), "reps": int(v["reps"]),
+                    "coverage": float(v["tracked_pct"])}
+            for joint, v in read_joints(path).items()}
 
 
 def draw_overlay(frame, pixel, angles):
@@ -552,14 +563,20 @@ class Main(QtWidgets.QMainWindow):
         self.sessions.setRowCount(len(rows))
         self.history_files = rows
         for row, path in enumerate(rows):
-            head = read_header(path)
+            # One file mangled by a spreadsheet re-save must cost one row, not the page.
+            try:
+                head = read_header(path)
+            except (OSError, csv.Error):
+                head = {"exercise": "(unreadable)"}
             key = head.get("exercise", head.get("mode", ""))
+            best = head.get("best_rom", "-")
+            if head.get("best_joint"):
+                best = f"{head['best_joint'].replace('_', ' ')} {best}"
             cells = [
                 stamp_of(path),
                 EXERCISE_DISPLAY.get(key, key or "-"),
                 head.get("duration_s", "-"),
-                head.get("stands", "") and f"{head['stands']} stands" or
-                head.get("best_rom", "-"),
+                head.get("stands", "") and f"{head['stands']} stands" or best,
                 head.get("framing_good_pct", "-") + "%"
                 if head.get("framing_good_pct") else "-",
             ]
@@ -579,30 +596,28 @@ class Main(QtWidgets.QMainWindow):
 
     def open_stored(self, item):
         path = self.history_files[item.row()]
-        rows = read_joints(path)
-        if not rows:
+        try:
+            head, stored = read_header(path), stored_summaries(path)
+        except (OSError, csv.Error, ValueError, KeyError) as exc:
+            QtWidgets.QMessageBox.warning(self, "rehaPose", f"Cannot read {path.name}: {exc}")
+            return
+        if not stored:
             QtWidgets.QMessageBox.warning(self, "rehaPose",
                                           f"{path.name} has no per-joint numbers.")
             return
-        for row, joint in enumerate(JOINTS):
-            values = rows.get(joint, {})
-            thin = float(values.get("tracked_pct", 0) or 0) < MIN_COVERAGE
-            cells = [joint.replace("_", " ")] + (
-                ["--", "--", "--", "--"] if thin else
-                [f"{float(values['rom_deg']):.0f}°", f"{float(values['peak_deg']):.0f}°",
-                 f"{float(values['min_deg']):.0f}°", values["reps"]]
-            ) + [f"{float(values.get('tracked_pct', 0) or 0):.0f}%"]
-            for col, text in enumerate(cells):
-                cell = QtWidgets.QTableWidgetItem(str(text))
-                if thin:
-                    cell.setForeground(QtGui.QBrush(QtGui.QColor("#a06060")))
-                self.results.setItem(row, col, cell)
+        self._fill_results(stored)
         # Viewing a stored session must not enable Save a Copy: that button writes the
         # LIVE session, which would land under the stored session's filename.
         self.viewing_stored = path
         self.stack.setCurrentIndex(1)
         self.pages.setCurrentIndex(0)
-        self.status.setText(f"Showing {path.name} (stored). Press Start for a new session.")
+        line = f"Showing {path.name} (stored). Press Start for a new session."
+        if head.get("stands"):
+            reference = head.get("reference") or "no published reference for this age"
+            line = (f"Chair stands: {head['stands']}.  Reference for an independent "
+                    f"{head.get('sex', '?')} aged {head.get('age', '?')}: {reference}.  "
+                    + line)
+        self.status.setText(line)
         self._sync()
 
     def on_exercise_changed(self):
@@ -796,7 +811,21 @@ class Main(QtWidgets.QMainWindow):
 
     def show_results(self):
         self.summaries = {j: summarize(self.angles[j]) for j in JOINTS}
-        for row, (joint, s) in enumerate(self.summaries.items()):
+        self._fill_results(self.summaries)
+        self.stack.setCurrentIndex(1)
+        try:
+            saved = f"Saved {self.autosave().name}"
+        except OSError as exc:
+            # A full disk or unplugged drive used to raise straight out of this slot -
+            # PyQt5's qFatal path, exit 134, and the session gone with the process.
+            saved = (f"NOT SAVED ({exc.strerror or exc}) - use File > Save a Copy "
+                     "before you start another session.")
+        self.status.setText(f"{self.verdict()}  {saved}")
+
+    def _fill_results(self, summaries):
+        empty = {"rom": 0.0, "peak": 0.0, "min": 0.0, "reps": 0, "coverage": 0.0}
+        for row, joint in enumerate(JOINTS):
+            s = summaries.get(joint, empty)
             thin = s["coverage"] < MIN_COVERAGE
             # Below the coverage floor the numbers are not reported at all. A dash is
             # honest; a number computed from a third of the frames is not.
@@ -809,15 +838,6 @@ class Main(QtWidgets.QMainWindow):
                 if thin:
                     item.setForeground(QtGui.QBrush(QtGui.QColor("#a06060")))
                 self.results.setItem(row, col, item)
-        self.stack.setCurrentIndex(1)
-        try:
-            saved = f"Saved {self.autosave().name}"
-        except OSError as exc:
-            # A full disk or unplugged drive used to raise straight out of this slot -
-            # PyQt5's qFatal path, exit 134, and the session gone with the process.
-            saved = (f"NOT SAVED ({exc.strerror or exc}) - use File > Save a Copy "
-                     "before you start another session.")
-        self.status.setText(f"{self.verdict()}  {saved}")
 
     def verdict(self):
         total = max((t[-1] for t in self.times.values() if t), default=0.0)
@@ -848,8 +868,11 @@ class Main(QtWidgets.QMainWindow):
 
     def write_csv(self, path):
         joints = list(JOINTS)
-        best = max((s["rom"] for s in self.summaries.values()
-                    if s["coverage"] >= MIN_COVERAGE), default=0.0)
+        reported = {j: s for j, s in self.summaries.items() if s["coverage"] >= MIN_COVERAGE}
+        # Named, because the largest ROM of eight joints is often not the joint the
+        # exercise is about - on a knee session it can be the elbow, the noisiest one.
+        best_joint = max(reported, key=lambda j: reported[j]["rom"], default="")
+        best = reported[best_joint]["rom"] if best_joint else 0.0
         duration = max((t[-1] for t in self.times.values() if t), default=0.0)
         rec = self.recorded
         # utf-8-sig: the BOM is what makes Excel show the degree sign instead of mojibake.
@@ -859,7 +882,7 @@ class Main(QtWidgets.QMainWindow):
             # label must not orphan every session recorded before the rename.
             writer.writerow(["exercise", rec["exercise"]])
             writer.writerow(["duration_s", f"{duration:.0f}"])
-            writer.writerow(["best_rom", f"{best:.0f}°"])
+            writer.writerow(["best_rom", f"{best:.0f}°", "best_joint", best_joint])
             if rec["chair"]:
                 writer.writerow(["stands", self.stand_count])
                 writer.writerow(["age", rec["age"], "sex", rec["sex"]])
