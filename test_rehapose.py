@@ -298,10 +298,10 @@ def check_shell(window, tmp, frame, poses):
     window.show_history()
     assert window.pages.currentIndex() == 1
     assert window.sessions.rowCount() == 3, window.sessions.rowCount()
-    assert window.sessions.item(0, 1).text() == "Knee flexion / extension"
-    assert head["best_joint"].replace("_", " ") in window.sessions.item(0, 3).text()
+    assert window.sessions.item(0, 2).text() == "Knee flexion / extension"
+    assert head["best_joint"].replace("_", " ") in window.sessions.item(0, 4).text()
     # The degree sign decodes as U+FFFD; the number, which is what matters, survives.
-    assert any(c.isdigit() for c in window.sessions.item(2, 3).text()), "cp1252 row lost"
+    assert any(c.isdigit() for c in window.sessions.item(2, 4).text()), "cp1252 row lost"
     viewing = window.viewing_stored
     window.open_stored(window.sessions.item(1, 0))      # junk: a warning, not a crash
     assert window.viewing_stored == viewing, "a refused file still took over the view"
@@ -319,6 +319,30 @@ def check_shell(window, tmp, frame, poses):
     window.show_history()
     assert window.sessions.rowCount() == 0
     assert "No sessions yet" in window.caption.text()
+
+    # Age and sex follow the person code, so one patient's norm never lands on the next.
+    window.person.setText("AB")
+    window.on_person_changed()            # a new code asks for the age again...
+    assert window.age.value() == rehapose.AGE_UNSET
+    window.age.setValue(72)               # ...which is entered after it
+    window._snapshot()
+    window.remember_person()
+    window.person.setText("CD")
+    window.on_person_changed()
+    assert window.age.value() == rehapose.AGE_UNSET, "new person inherited an age"
+    window._snapshot()
+    assert window.recorded["age"] is None
+    window.recorded["chair"], window.time_called = True, True
+    assert "Age not entered" in window.verdict(), window.verdict()
+    saved = window.autosave()
+    head = rehapose.read_header(saved)
+    assert head["person"] == "CD" and head["age"] == "", head
+    window.show_history()
+    assert window.sessions.item(0, 1).text() == "CD"
+    saved.unlink()
+    window.person.setText("AB")
+    window.on_person_changed()
+    assert window.age.value() == 72, "known person's age was not restored"
 
     # Settings round-trip, so the app reopens the way it was left.
     window.age.setValue(81)

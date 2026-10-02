@@ -37,6 +37,7 @@ VERSION = "0.2"
 MODEL_DIR = Path.home() / ".cache" / "rehapose"
 LEGACY_SESSIONS = MODEL_DIR / "sessions"
 MIN_COVERAGE = 80.0   # below this a row is not reported as a measurement
+AGE_UNSET = 17        # the age spinbox's "not entered" value, shown as "age ?"
 TIPS = ("Stand side-on to the camera, with your whole body in frame.\n\n"
         "Good light in front of you, not behind. Clothing that shows your\n"
         "knees and hips reads better than loose trousers.\n\n"
@@ -412,8 +413,17 @@ class Main(QtWidgets.QMainWindow):
         for key, display, _ in EXERCISES:
             self.exercise.addItem(display, key)
         self.exercise.currentIndexChanged.connect(self.on_exercise_changed)
+        self.person = QtWidgets.QLineEdit()
+        self.person.setPlaceholderText("person code")
+        self.person.setToolTip("Initials or a code, not a name - it is written into "
+                               "every session file.")
+        self.person.setMaxLength(24)
+        self.person.setFixedWidth(130)
+        self.person.editingFinished.connect(self.on_person_changed)
+        self.last_person = ""
         self.age = QtWidgets.QSpinBox()
-        self.age.setRange(18, 99)
+        self.age.setRange(AGE_UNSET, 99)
+        self.age.setSpecialValueText("age ?")
         self.age.setValue(70)
         self.age.setPrefix("age ")
         self.sex = QtWidgets.QComboBox()
@@ -424,6 +434,7 @@ class Main(QtWidgets.QMainWindow):
         top = QtWidgets.QHBoxLayout()
         top.addWidget(QtWidgets.QLabel("Exercise:"))
         top.addWidget(self.exercise)
+        top.addWidget(self.person)
         top.addWidget(self.age)
         top.addWidget(self.sex)
         top.addWidget(self.cue)
@@ -521,6 +532,8 @@ class Main(QtWidgets.QMainWindow):
             self.exercise.setCurrentIndex(index)
         self.age.setValue(s.value("age", 70, type=int))
         self.sex.setCurrentText(s.value("sex", "female", type=str))
+        self.person.setText(s.value("person", "", type=str))
+        self.last_person = self.person.text().strip()
         self.cue.setChecked(s.value("beep", True, type=bool))
 
     def save_settings(self):
@@ -529,6 +542,7 @@ class Main(QtWidgets.QMainWindow):
         s.setValue("exercise", self.exercise.currentData())
         s.setValue("age", self.age.value())
         s.setValue("sex", self.sex.currentText())
+        s.setValue("person", self.person.text().strip())
         s.setValue("beep", self.cue.isChecked())
 
     def _sync(self):
@@ -542,7 +556,7 @@ class Main(QtWidgets.QMainWindow):
         reviewing = bool(self.summaries) and self.viewing_stored is None
         self.button.setText("Stop" if recording else "Start")
         self.act_run.setText("Stop" if recording else "Start")
-        for widget in (self.exercise, self.age, self.sex):
+        for widget in (self.exercise, self.person, self.age, self.sex):
             widget.setEnabled(not recording)
         self.export.setEnabled(reviewing)
         self.act_save.setEnabled(reviewing)
@@ -576,9 +590,9 @@ class Main(QtWidgets.QMainWindow):
     def _build_history(self):
         self.caption = QtWidgets.QLabel()
         self.caption.setWordWrap(True)
-        self.sessions = QtWidgets.QTableWidget(0, 5)
+        self.sessions = QtWidgets.QTableWidget(0, 6)
         self.sessions.setHorizontalHeaderLabels(
-            ["Date", "Exercise", "Length", "Result", "Framing"])
+            ["Date", "Person", "Exercise", "Length", "Result", "Framing"])
         self.sessions.horizontalHeader().setSectionResizeMode(
             QtWidgets.QHeaderView.Stretch)
         self.sessions.verticalHeader().setVisible(False)
@@ -614,6 +628,7 @@ class Main(QtWidgets.QMainWindow):
                 best = f"{head['best_joint'].replace('_', ' ')} {best}"
             cells = [
                 stamp_of(path),
+                head.get("person") or "-",
                 EXERCISE_DISPLAY.get(key, key or "-"),
                 head.get("duration_s", "-"),
                 head.get("stands", "") and f"{head['stands']} stands"
@@ -663,6 +678,27 @@ class Main(QtWidgets.QMainWindow):
         self.status.setText(line)
         self._sync()
 
+    def on_person_changed(self):
+        """Age and sex belong to a person, not to the machine. Carried over silently,
+        they put the last patient's norm beside the next patient's count."""
+        code = self.person.text().strip()
+        if code == self.last_person:
+            return
+        self.last_person = code
+        known = (settings().value("people") or {}).get(code)
+        if known:
+            self.age.setValue(int(known[0]))
+            self.sex.setCurrentText(str(known[1]))
+        else:
+            self.age.setValue(AGE_UNSET)        # ask, rather than inherit
+
+    def remember_person(self):
+        rec = self.recorded
+        if rec["person"] and rec["age"] is not None:
+            people = dict(settings().value("people") or {})
+            people[rec["person"]] = [rec["age"], rec["sex"]]
+            settings().setValue("people", people)
+
     def on_exercise_changed(self):
         self.age.setVisible(self.chair_mode)
         self.sex.setVisible(self.chair_mode)
@@ -682,8 +718,11 @@ class Main(QtWidgets.QMainWindow):
     def _snapshot(self):
         """What is being recorded, frozen at Start. The widgets unlock again on Stop, so
         reading them at save time filed a copy under whatever the combo said by then."""
+        age = self.age.value()
         self.recorded = {"exercise": self.exercise_key, "chair": self.chair_mode,
-                         "age": self.age.value(), "sex": self.sex.currentText()}
+                         "person": self.person.text().strip(),
+                         "age": None if age == AGE_UNSET else age,
+                         "sex": self.sex.currentText()}
 
     def start(self):
         if choose_data_dir(self) is None:
@@ -695,7 +734,9 @@ class Main(QtWidgets.QMainWindow):
         self.counted, self.time_called, self.final_counted = None, False, False
         self.clock_start, self.setup_ok, self.frames = None, 0, 0
         self.summaries, self.viewing_stored = {}, None
+        self.on_person_changed()     # Cmd+R from inside the field skips editingFinished
         self._snapshot()
+        self.remember_person()
         for joint, curve in self.curves.items():
             curve.setData([], [])
             self.plots[joint].setTitle(joint.replace("_", " "))
@@ -914,7 +955,8 @@ class Main(QtWidgets.QMainWindow):
             norm = chair_stand_norm(rec["age"], rec["sex"])
             reference = (f"Reference for an independent {rec['sex']} aged "
                          f"{rec['age']}: {norm}." if norm else
-                         "No published reference for this age.")
+                         "Age not entered, so no reference is shown." if rec["age"] is None
+                         else "No published reference for this age.")
             if not self.time_called:
                 # A count from a test stopped at 12 s is not comparable to a 30 s norm,
                 # so the norm is not printed beside it.
@@ -955,7 +997,7 @@ class Main(QtWidgets.QMainWindow):
             writer = csv.writer(handle)
             # The KEY, never the display text: History shows this, and renaming a
             # label must not orphan every session recorded before the rename.
-            writer.writerow(["exercise", rec["exercise"]])
+            writer.writerow(["exercise", rec["exercise"], "person", rec["person"]])
             writer.writerow(["duration_s", f"{duration:.0f}"])
             # Provenance, so a later analysis can tell which model produced which angles.
             writer.writerow(["app_version", VERSION, "model", self.model_tier])
@@ -964,7 +1006,8 @@ class Main(QtWidgets.QMainWindow):
             if rec["chair"]:
                 writer.writerow(["stands", self.stand_count,
                                  "complete", "yes" if self.time_called else "no"])
-                writer.writerow(["age", rec["age"], "sex", rec["sex"]])
+                writer.writerow(["age", "" if rec["age"] is None else rec["age"],
+                                 "sex", rec["sex"]])
                 writer.writerow(["reference", chair_stand_norm(rec["age"], rec["sex"])])
             framing = 100.0 * self.setup_ok / max(self.frames, 1)
             writer.writerow(["framing_good_pct", f"{framing:.1f}"])

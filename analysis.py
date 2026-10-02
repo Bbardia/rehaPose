@@ -300,7 +300,9 @@ def chair_stand_score(knee, lo=CHAIR_STAND_LO, hi=CHAIR_STAND_HI):
 
 
 def chair_stand_norm(age, sex):
-    """Reference number of stands, or None if the age is outside the published table."""
+    """Reference number of stands, or None if the age is unknown or outside the table."""
+    if age is None:
+        return None
     for (low, high), (women, men) in CHAIR_STAND_NORMS.items():
         if low <= age <= high:
             return women if sex == "female" else men
@@ -391,6 +393,7 @@ def demo():
     assert chair_stand_norm(72, "female") == 14
     assert chair_stand_norm(72, "male") == 15
     assert chair_stand_norm(30, "female") is None
+    assert chair_stand_norm(None, "female") is None
 
     # Ratchet: a fast machine locks on tier 0 and never steps down.
     r = TierRatchet(2, budget_ms=40.0)
