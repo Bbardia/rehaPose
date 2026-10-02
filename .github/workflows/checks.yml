@@ -10,6 +10,7 @@ jobs:
     # SIGABRT, scipy's dlopen on new macOS) was macOS arm64 native code, which a Linux
     # runner cannot reproduce.
     runs-on: macos-14
+    timeout-minutes: 15   # a modal dialog offscreen hangs forever; fail instead
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -22,7 +23,7 @@ jobs:
           # The model URL and MD5s are pinned, so the cache is valid until they change.
           key: rehapose-models-${{ hashFiles('rehapose.py') }}
           restore-keys: rehapose-models-
-      - run: pip install -r requirements.txt ruff
+      - run: pip install -r requirements.txt ruff==0.16.8   # bump deliberately
       - run: ruff check .
       - run: python analysis.py
       - run: python test_rehapose.py

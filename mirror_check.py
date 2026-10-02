@@ -42,7 +42,10 @@ def mirror_gaps(path, tier):
     cap = cv2.VideoCapture(str(path))
     if not cap.isOpened():
         raise SystemExit(f"cannot open {path}")
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    # Broken or VFR metadata reports 0, NaN, or a timebase like 90000. VIDEO mode needs
+    # strictly increasing millisecond stamps, so anything above 1000 fps would repeat one.
+    fps = fps if 0 < fps <= 1000 else 30.0
     straight, mirrored = landmarker(tier), landmarker(tier)
     gaps = {j.split("_", 1)[1]: [] for j in JOINTS}
     frames = 0
