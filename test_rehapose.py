@@ -22,8 +22,9 @@ from analysis import JOINTS
 from PyQt5 import QtCore, QtWidgets
 
 
-SAMPLE_URL = ("https://raw.githubusercontent.com/open-mmlab/mmpose/main/"
-              "tests/data/coco/000000000785.jpg")
+# Pinned to a commit: "main" of an unmaintained repo can move or vanish under the test.
+SAMPLE_URL = ("https://raw.githubusercontent.com/open-mmlab/mmpose/"
+              "ec2f372f002d1d534ea01a13033d09f5483256db/tests/data/coco/000000000785.jpg")
 
 
 def sample_frame():

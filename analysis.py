@@ -390,6 +390,12 @@ def demo():
     assert chair_stand_score(list(np.linspace(90, 40, 8))) == (1, True)  # first rise
     assert chair_stand_score([None, None]) == (0, False)
 
+    # Keys are written into every session file, so they are frozen: append, never edit.
+    assert [k for k, _, _ in EXERCISES][:7] == [
+        "chair_stand_30s", "knee_flexion", "hip_abduction", "shoulder_abduction",
+        "shoulder_flexion", "heel_slides", "other"]
+    assert len({k for k, _, _ in EXERCISES}) == len(EXERCISES), "duplicate exercise key"
+
     assert chair_stand_norm(72, "female") == 14
     assert chair_stand_norm(72, "male") == 15
     assert chair_stand_norm(30, "female") is None
