@@ -19,10 +19,13 @@ python3.11 -m venv .venv
 ```
 
 That is the whole install. Three dependencies, no compilation, no CUDA toolkit, no model
-zoo. The pose model (~6 MB or ~30 MB) downloads itself to `~/.cache/rehapose/` the first
-time you press Start — **the first run needs a network connection for that one download**.
-Everything after it runs offline. The model version is pinned and the download is checked
-against its published MD5, so the model cannot change underneath you between sessions.
+zoo. The two pose models (~6 MB and ~30 MB) download themselves to `~/.cache/rehapose/`
+the first time you press Start — **the first run needs a network connection for that one
+download**. Both come down up front, so a switch to the smaller one can never stall a
+session on a download.
+Everything after it runs offline. The model version is pinned and every model file is
+checked against its published MD5, so the model cannot change underneath you between
+sessions.
 
 On first use rehaPose asks where to keep your sessions. Pick somewhere you can find and
 back up; `~/Documents/rehaPose` is the default. Any sessions from an older version are
@@ -52,13 +55,16 @@ by itself and the numbers appear on the right.
 
 **Person code.** Type initials or a code (not a name) in the field next to the exercise.
 It is written into every session and shown in History. Age and sex are remembered per
-code, and a new code asks for the age again (`age ?`) rather than inheriting the last
-person's — otherwise the previous patient's reference would print beside the next
-patient's count.
+code, and a new code asks for both again (`age ?`, `sex ?`) rather than inheriting the
+last person's — otherwise the previous patient's reference would print beside the next
+patient's count. Until both are entered, a chair stand prints its count with no
+reference.
 
 In every mode the app will not start measuring until the setup is good. It tells you
 what is wrong — side-on, whole body in frame, not clipping the edge — and starts the
-clock the moment you are in position, not when you press the button. That matters:
+clock once you have *held* that position for about a third of a second, not when you
+press the button. One lucky frame does not count: the side-on reading is noisy enough
+that a single frame can pass on a camera position that is not good. That matters:
 camera placement is the largest error source you actually control.
 
 Graphs show a rolling 20 seconds; the full session is kept and analysed on Stop. A gap
@@ -92,7 +98,9 @@ somewhere else as well, and **File → Show Sessions Folder** opens the folder.
 If the framing never came good, nothing is written: an all-zeros row is not a session.
 If the camera fails mid-session, what was recorded up to that point is kept and saved.
 If the save itself fails (full disk, unplugged drive) the status line says **NOT SAVED**
-and the results stay on screen — use **Save a Copy** before starting another session.
+and the results stay on screen. Until a copy exists the app will not let that session
+go quietly: Start, Quit and opening a stored session all stop and ask first, and opening
+History retries the save by itself once the folder is back.
 
 Each file also records the person code, app version, model tier (`heavy`/`lite`) and
 mediapipe version, so a later analysis can tell which model produced which angles. Files
