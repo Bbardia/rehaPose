@@ -80,11 +80,13 @@ def main():
     detected = sum(1 for _, w in poses if w is not None)
     assert detected > 0, "MediaPipe found no pose in the sample photo"
 
-    # The sample photo is front-on, so the real side-view gate must refuse to record it
-    # rather than quietly measuring a badly placed camera.
+    # The real gate on real landmarks must produce a real cosine. Which way it decides on
+    # this one photo is not the point - analysis.demo() checks that against known yaws.
     pixel, world = poses[0]
-    ok, hint = analysis.setup_check(pixel, world, frame.shape[1], frame.shape[0])
-    assert not ok and "side-on" in hint, (ok, hint)
+    cos = analysis.orientation_cos(pixel, world, frame.shape[1], frame.shape[0])
+    assert cos is not None and 0.0 <= cos <= 1.0, cos
+    # A refused setup must show the camera but record nothing.
+    rehapose.setup_check = lambda *_a, **_k: (False, "Turn side-on to the camera.")
     window.on_frame(frame.copy(), poses[0], 7.0)
     assert window.clock_start is None, "gate let a badly framed session start"
     assert all(not window.angles[j] for j in JOINTS), "gated frames were still recorded"

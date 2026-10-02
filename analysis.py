@@ -215,7 +215,11 @@ def orientation_cos(pixel, world, frame_w, frame_h):
     """
     span_px = abs(pixel[11].x - pixel[12].x) * frame_w
     torso_px = abs((pixel[11].y + pixel[12].y) / 2 - (pixel[23].y + pixel[24].y) / 2) * frame_h
-    span_m = abs(world[11].x - world[12].x)
+    # The TRUE 3D shoulder width, not its x component. World landmarks are camera-
+    # aligned, so world x shrinks with yaw exactly as the image does and the ratio
+    # cancelled the very turn it exists to measure: ~1.0 at every yaw.
+    span_m = math.dist((world[11].x, world[11].y, world[11].z),
+                       (world[12].x, world[12].y, world[12].z))
     torso_m = abs((world[11].y + world[12].y) / 2 - (world[23].y + world[24].y) / 2)
     if torso_px < 1e-6 or span_m < 1e-9 or torso_m < 1e-9:
         return None
@@ -394,6 +398,40 @@ def demo():
     f = OneEuro()
     outs = [f(v, i / 30.0) for i, v in enumerate(np.linspace(0, 90, 60))]
     assert max(outs) <= 90.0 + 1e-6 and outs[-1] > 80.0, (max(outs), outs[-1])
+
+    # Orientation: a body turned by `yaw` must read |cos(yaw)|, whatever the frame shape.
+    def body(yaw, w=1280, h=720, px_per_m=300.0):
+        c, s_ = math.cos(math.radians(yaw)), math.sin(math.radians(yaw))
+        joints = {0: (0, -0.75), 11: (0.2, -0.5), 12: (-0.2, -0.5), 23: (0.1, 0.0),
+                  24: (-0.1, 0.0), 25: (0.1, 0.45), 26: (-0.1, 0.45), 27: (0.1, 0.9),
+                  28: (-0.1, 0.9)}
+        world, pixel = [P(0, 0, 0)] * 33, [P(0.5, 0.5, 0)] * 33
+        for i, (x, y) in joints.items():
+            world[i] = P(x * c, y, -x * s_)          # yaw about the vertical axis
+            pixel[i] = P((w / 2 + px_per_m * x * c) / w, (h / 2 + px_per_m * y) / h, 0)
+        return pixel, world
+
+    for yaw in (0, 30, 60, 85):
+        pixel, world = body(yaw)
+        got = orientation_cos(pixel, world, 1280, 720)
+        assert abs(got - abs(math.cos(math.radians(yaw)))) < 1e-6, (yaw, got)
+    # Same pose, different frame shape: the cosine must not change.
+    pixel_w, world_w = body(60, 1280, 720)
+    pixel_s, world_s = body(60, 720, 720)
+    assert abs(orientation_cos(pixel_w, world_w, 1280, 720)
+               - orientation_cos(pixel_s, world_s, 720, 720)) < 1e-6
+
+    # Every branch of the setup check, from synthetic poses.
+    assert setup_check(None, None, 1280, 720)[0] is False
+    assert setup_check(*body(80), 1280, 720) == (True, "Setup looks good.")
+    ok, hint = setup_check(*body(0), 1280, 720)
+    assert not ok and "side-on" in hint, hint
+    assert setup_check(*body(0), 1280, 720, view="front")[0]
+    pixel, world = body(80)
+    pixel[27] = P(pixel[27].x, pixel[27].y, 0, v=0.1)
+    assert "Whole body" in setup_check(pixel, world, 1280, 720)[1]
+    pixel, world = body(80, px_per_m=420.0)               # feet run off the bottom
+    assert "edge" in setup_check(pixel, world, 1280, 720)[1]
 
     print("analysis.py self-check passed")
 
