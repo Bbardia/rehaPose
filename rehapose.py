@@ -181,7 +181,7 @@ class PoseWorker(QtCore.QThread):
     def __init__(self, camera=0):
         super().__init__()
         self.camera = camera
-        self.tier = TIERS[0]
+        self.tier_log = [TIERS[0]]     # every tier this session ran on, in order
         self._stop = False
 
     def stop(self):
@@ -272,7 +272,7 @@ class PoseWorker(QtCore.QThread):
                 if tier is not None:
                     landmarker.close()
                     landmarker = self._make(models[TIERS[tier]])
-                    self.tier = TIERS[tier]
+                    self.tier_log.append(TIERS[tier])
                     self.status.emit(
                         f"Backend: MediaPipe {TIERS[tier]} (auto: too slow for "
                         f"{TIERS[tier - 1]})")
@@ -408,6 +408,8 @@ class Main(QtWidgets.QMainWindow):
         self.summaries = {}
         self.viewing_stored = None
         self.model_tier = ""
+        self.unsaved = False     # the last session's autosave failed and no copy exists
+        self.retiring = None     # a stopped worker that outlived its 2 s wait
         MODEL_DIR.mkdir(parents=True, exist_ok=True)
         self.sounds = {}
         for name, (freq, ms) in TONES.items():
@@ -638,6 +640,11 @@ class Main(QtWidgets.QMainWindow):
         target = choose_data_dir(self)
         if target is None:
             return
+        if self.unsaved:
+            # The folder is reachable again (that is how we got here): retry the save.
+            with contextlib.suppress(OSError):
+                self.status.setText(f"Saved {self.autosave().name} (on retry)")
+                self.unsaved = False
         rows = sorted(target.glob("*.csv"), reverse=True)
         self.sessions.setRowCount(len(rows))
         self.history_files = rows
@@ -676,6 +683,11 @@ class Main(QtWidgets.QMainWindow):
         self.pages.setCurrentIndex(1)
 
     def open_stored(self, item):
+        if self.unsaved:
+            QtWidgets.QMessageBox.warning(
+                self, "rehaPose", "The last session was not saved. Save a copy first "
+                "(File > Save a Copy) - opening another session would hide it.")
+            return
         path = self.history_files[item.row()]
         try:
             head, stored = read_header(path), stored_summaries(path)
@@ -749,7 +761,31 @@ class Main(QtWidgets.QMainWindow):
                          "age": None if age == AGE_UNSET else age,
                          "sex": self.sex.currentText()}
 
+    def confirm_discard(self):
+        """True if it is fine to drop the current session. Only asks when the autosave
+        failed, because then the results on screen are the only copy there is."""
+        if not self.unsaved:
+            return True
+        box = QtWidgets.QMessageBox
+        answer = box.question(
+            self, "rehaPose", "The last session was NOT saved.\n\nSave a copy first?",
+            box.Save | box.Discard | box.Cancel, box.Save)
+        if answer == box.Save:
+            self.save_csv()
+            return not self.unsaved
+        if answer == box.Discard:
+            self.unsaved = False
+            return True
+        return False
+
     def start(self):
+        if not self.confirm_discard():
+            return
+        old = self.retiring
+        if old is not None and not sip.isdeleted(old) and old.isRunning():
+            # Two workers at once would both download into the same .part file.
+            self.status.setText("Still stopping the previous session - try again shortly.")
+            return
         if choose_data_dir(self) is None:
             return
         self.times = {j: [] for j in JOINTS}
@@ -793,18 +829,23 @@ class Main(QtWidgets.QMainWindow):
                 # freed when it finishes, or simply never, if the app exits first.
                 sip.transferto(worker, None)
                 worker.finished.connect(worker.deleteLater)
-            self.model_tier = worker.tier
+                self.retiring = worker
+            # "heavy->lite" if the ratchet stepped down: the tiers disagree by up to
+            # ~50 deg on one joint, so the file must not credit it all to one model.
+            self.model_tier = "->".join(worker.tier_log)
 
     def stop(self):
         if not self.worker:
             return
         self._detach()
         if not self.measured:
-            # Nothing was ever measured - the framing never came good. Writing this
-            # would put an all-zeros row at the top of History.
+            # Nothing was ever measured. Writing this would put an all-zeros row at the
+            # top of History.
             self.video.setText(TIPS)
-            self.status.setText("Nothing recorded - the framing never came good. "
-                                "See Help > How to Record.")
+            self.status.setText(
+                "Stopped before the test started - nothing recorded."
+                if self.clock_start is not None else
+                "Nothing recorded - the framing never came good. See Help > How to Record.")
             self._sync()
             return
         self.show_results()
@@ -953,7 +994,9 @@ class Main(QtWidgets.QMainWindow):
         self.stack.setCurrentIndex(1)
         try:
             saved = f"Saved {self.autosave().name}"
+            self.unsaved = False
         except OSError as exc:
+            self.unsaved = True
             # A full disk or unplugged drive used to raise straight out of this slot -
             # PyQt5's qFatal path, exit 134, and the session gone with the process.
             saved = (f"NOT SAVED ({exc.strerror or exc}) - use File > Save a Copy "
@@ -990,7 +1033,7 @@ class Main(QtWidgets.QMainWindow):
             if not self.time_called:
                 # A count from a test stopped at 12 s is not comparable to a 30 s norm,
                 # so the norm is not printed beside it.
-                reference = (f"Stopped at {total:.0f}s - not a 30-second score, so no "
+                reference = (f"Stopped at {total:.1f}s - not a 30-second score, so no "
                              "reference is shown.")
             elif self.final_counted:
                 reference = ("Includes a final stand more than halfway up at 30 s, "
@@ -1071,6 +1114,7 @@ class Main(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.warning(self, "rehaPose",
                                           f"Could not save {path}: {exc.strerror or exc}")
             return
+        self.unsaved = False
         self.status.setText(f"Saved {path}")
 
     def closeEvent(self, event):
@@ -1086,9 +1130,10 @@ class Main(QtWidgets.QMainWindow):
                 event.ignore()
                 return
             self.stop()
-            self.save_settings()
             QtWidgets.QMessageBox.information(self, "rehaPose", self.status.text())
-            event.accept()
+        # A failed autosave leaves the screen as the only copy; quitting would lose it.
+        if not self.confirm_discard():
+            event.ignore()
             return
         self.save_settings()
         event.accept()

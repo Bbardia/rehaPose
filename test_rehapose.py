@@ -205,7 +205,7 @@ def check_chair_stand(window, app, frame, poses):
 class FakeWorker:
     """Stands in for PoseWorker so stop() can be exercised without a camera."""
 
-    tier = "lite"
+    tier_log = ["lite"]
 
     def stop(self):
         pass
@@ -255,7 +255,27 @@ def check_shell(window, tmp, frame, poses):
     rehapose.settings().setValue("dataDir", str(blocker))
     window.show_results()
     assert "NOT SAVED" in window.status.text(), window.status.text()
+    assert window.unsaved
+    # While unsaved, nothing may quietly replace the only copy on screen.
+    box = QtWidgets.QMessageBox
+    box.question = staticmethod(lambda *_a, **_k: box.Cancel)
+    window.start()
+    assert window.worker is None, "Start discarded an unsaved session"
+    warned = []
+    box.warning = staticmethod(lambda *a, **_k: warned.append(a[2]))
+    window.history_files = [blocker]
+    window.open_stored(QtWidgets.QTableWidgetItem())
+    assert warned and "not saved" in warned[0], warned
+    box.warning = staticmethod(lambda *_a, **_k: None)
+    # Once the folder is back, opening History retries the save by itself.
     rehapose.settings().setValue("dataDir", tmp)
+    before = set(rehapose.session_dir().glob("*.csv"))
+    window.show_history()
+    assert not window.unsaved and "on retry" in window.status.text(), window.status.text()
+    retried = set(rehapose.session_dir().glob("*.csv")) - before
+    assert len(retried) == 1
+    retried.pop().unlink()
+    window.pages.setCurrentIndex(0)
 
     # Stopping with nothing ever measured must not write an all-zeros session.
     recorded, window.times = window.times, {j: [] for j in JOINTS}
