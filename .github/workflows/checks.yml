@@ -1,0 +1,30 @@
+name: checks
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  checks:
+    # Apple Silicon on purpose: every failure recorded so far (mediapipe 1.0.1's Metal
+    # SIGABRT, scipy's dlopen on new macOS) was macOS arm64 native code, which a Linux
+    # runner cannot reproduce.
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/rehapose
+          # The model URL and MD5s are pinned, so the cache is valid until they change.
+          key: rehapose-models-${{ hashFiles('rehapose.py') }}
+          restore-keys: rehapose-models-
+      - run: pip install -r requirements.txt ruff
+      - run: ruff check .
+      - run: python analysis.py
+      - run: python test_rehapose.py
+        env:
+          QT_QPA_PLATFORM: offscreen
