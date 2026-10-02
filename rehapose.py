@@ -28,8 +28,8 @@ from PyQt5 import QtCore, QtGui, QtMultimedia, QtWidgets
 
 from analysis import (CHAIR_STAND_HI, CHAIR_STAND_LO, CHAIR_STAND_SECONDS,
                       CONNECTIONS, EXERCISE_DISPLAY, EXERCISES, JOINTS, OneEuro,
-                      TierRatchet, chair_stand_norm, count_reps, flexion, setup_check,
-                      summarize, visible)
+                      TierRatchet, chair_stand_norm, chair_stand_score, count_reps,
+                      flexion, setup_check, summarize, visible)
 
 VERSION = "0.2"
 # The model cache stays in ~/.cache - it is re-downloadable, which is what a cache is
@@ -129,6 +129,9 @@ TIERS = ("heavy", "lite")
 BUDGET_MS = 40.0    # 25 fps of inference, leaving room for camera + plots
 RATCHET_S = 5.0     # after this many seconds of *detected pose*, the tier is locked
 LIVE_WINDOW_S = 20.0
+COUNTDOWN_S = 3     # before a scored test, so its 30 s starts on a signal, not on framing
+# (Hz, ms). Distinct pitches so "go" and "time" are unmistakable without looking.
+TONES = {"rep": (880, 90), "tick": (660, 120), "go": (1320, 350), "end": (440, 700)}
 
 
 def ensure_model(tier):
@@ -266,7 +269,8 @@ def mediapipe_version():
 
 
 def make_beep(path, freq=880.0, ms=90, rate=44100):
-    """Generate the rep cue as a .wav rather than shipping a binary asset."""
+    """Generate a cue as a .wav rather than shipping a binary asset. Cached by path, so
+    the filename must encode the tone."""
     if path.exists():
         return path
     n = int(rate * ms / 1000)
@@ -324,6 +328,17 @@ def read_joints(path):
     return rows
 
 
+def big_text(frame, text):
+    """Large outlined text in the top-left corner - drawn AFTER the mirror flip, or it
+    reads backwards."""
+    h = frame.shape[0]
+    scale, org = h / 160, (int(h * 0.04), int(h * 0.22))
+    for color, width in (((0, 0, 0), 18), ((255, 255, 255), 6)):
+        cv2.putText(frame, text, org, cv2.FONT_HERSHEY_SIMPLEX, scale, color, width,
+                    cv2.LINE_AA)
+    return frame
+
+
 def stored_summaries(path):
     """Block 2 in the shape summarize() returns, so one renderer serves live and stored.
     Raises ValueError/KeyError on a file that has been edited out of shape."""
@@ -367,8 +382,14 @@ class Main(QtWidgets.QMainWindow):
         self.summaries = {}
         self.viewing_stored = None
         self.model_tier = ""
-        self.sound = QtMultimedia.QSoundEffect()
-        self.sound.setSource(QtCore.QUrl.fromLocalFile(str(make_beep(MODEL_DIR / "rep.wav"))))
+        MODEL_DIR.mkdir(parents=True, exist_ok=True)
+        self.sounds = {}
+        for name, (freq, ms) in TONES.items():
+            self.sounds[name] = QtMultimedia.QSoundEffect()
+            self.sounds[name].setSource(QtCore.QUrl.fromLocalFile(str(
+                make_beep(MODEL_DIR / f"tone-{freq}-{ms}.wav", freq, ms))))
+        self.counted = None     # last countdown number shown, None outside a countdown
+        self.time_called = self.final_counted = False
         self.setWindowTitle("rehaPose")
         self.resize(1500, 820)
 
@@ -595,7 +616,8 @@ class Main(QtWidgets.QMainWindow):
                 stamp_of(path),
                 EXERCISE_DISPLAY.get(key, key or "-"),
                 head.get("duration_s", "-"),
-                head.get("stands", "") and f"{head['stands']} stands" or best,
+                head.get("stands", "") and f"{head['stands']} stands"
+                + (" (stopped early)" if head.get("complete") == "no" else "") or best,
                 head.get("framing_good_pct", "-") + "%"
                 if head.get("framing_good_pct") else "-",
             ]
@@ -633,6 +655,8 @@ class Main(QtWidgets.QMainWindow):
         line = f"Showing {path.name} (stored). Press Start for a new session."
         if head.get("stands"):
             reference = head.get("reference") or "no published reference for this age"
+            if head.get("complete") == "no":
+                reference = "none shown - the test was stopped before 30 s"
             line = (f"Chair stands: {head['stands']}.  Reference for an independent "
                     f"{head.get('sex', '?')} aged {head.get('age', '?')}: {reference}.  "
                     + line)
@@ -668,6 +692,7 @@ class Main(QtWidgets.QMainWindow):
         self.angles = {j: [] for j in JOINTS}
         self.filters = {j: OneEuro() for j in JOINTS}
         self.stands, self.stand_count = [], 0
+        self.counted, self.time_called, self.final_counted = None, False, False
         self.clock_start, self.setup_ok, self.frames = None, 0, 0
         self.summaries, self.viewing_stored = {}, None
         self._snapshot()
@@ -743,12 +768,13 @@ class Main(QtWidgets.QMainWindow):
         h, w = frame.shape[:2]
         ok, hint = setup_check(pixel, world, w, h)
         if ok and self.clock_start is None:
-            self.clock_start = time.perf_counter()
+            lead = COUNTDOWN_S if self.recorded["chair"] else 0
+            self.clock_start = time.perf_counter() + lead
             self.t0 = self.clock_start
         # Only frames from the recording itself count towards the framing figure. Frames
         # spent walking into shot are not a measurement, and counting them diluted the
         # percentage by however long the user took to get into position.
-        if self.clock_start is not None:
+        if self.clock_start is not None and time.perf_counter() >= self.clock_start:
             self.frames += 1
             self.setup_ok += ok
         return ok, hint
@@ -775,10 +801,12 @@ class Main(QtWidgets.QMainWindow):
             return
         pixel, world = landmarks
         ok, hint = self.gate(pixel, world, frame)
-        if self.clock_start is None:
-            self.show_frame(cv2.flip(frame, 1))
-            self.status.setText(f"Setup: {hint}")
+        if self.clock_start is None or time.perf_counter() < self.clock_start:
+            self.show_waiting(cv2.flip(frame, 1), hint)
             return
+        if self.counted:            # first measured frame after a countdown
+            self.counted = 0
+            self.sounds["go"].play()
 
         now = time.perf_counter() - self.t0
         current = self.measure(pixel, world, now)
@@ -787,7 +815,10 @@ class Main(QtWidgets.QMainWindow):
             frame = draw_overlay(frame, pixel, current)
         # Mirror at display time only, so the overlay still lines up and the
         # left/right labels stay anatomically correct.
-        self.show_frame(cv2.flip(frame, 1))
+        shown = cv2.flip(frame, 1)
+        if self.recorded["chair"]:
+            big_text(shown, str(self.stand_count))
+        self.show_frame(shown)
         self.update_plots(now, current)
 
         note = "" if ok else f"   |   {hint}"
@@ -797,15 +828,32 @@ class Main(QtWidgets.QMainWindow):
             self.status.setText(f"{self.backend}  |  {dt:.0f} ms/frame  "
                                 f"({1000 / max(dt, 1e-6):.0f} fps){note}")
 
+    def show_waiting(self, shown, hint):
+        """Before the clock: setup hints, then a 3-2-1 with a tone per number."""
+        if self.clock_start is None:
+            self.status.setText(f"Setup: {hint}")
+        else:
+            n = math.ceil(self.clock_start - time.perf_counter())
+            if n != self.counted:
+                self.counted = n
+                self.sounds["tick"].play()
+            big_text(shown, str(n))
+            self.status.setText(f"Get ready - starting in {n}")
+        self.show_frame(shown)
+
     def tick_chair_stand(self, now, note):
         """Count stands and run the 30 s clock, stopping the session when it expires."""
         count = count_reps(self.stands, lo=CHAIR_STAND_LO, hi=CHAIR_STAND_HI)
         if count > self.stand_count:
             self.stand_count = count
             if self.cue.isChecked():
-                self.sound.play()
+                self.sounds["rep"].play()
         left = CHAIR_STAND_SECONDS - now
         if left <= 0:
+            # Time is called: the protocol's final-stand rule applies now, and only now.
+            self.stand_count, self.final_counted = chair_stand_score(self.stands)
+            self.time_called = True
+            self.sounds["end"].play()
             self.stop()
             return
         self.status.setText(f"Chair stand: {self.stand_count}   |   {left:.0f}s left{note}")
@@ -867,6 +915,14 @@ class Main(QtWidgets.QMainWindow):
             reference = (f"Reference for an independent {rec['sex']} aged "
                          f"{rec['age']}: {norm}." if norm else
                          "No published reference for this age.")
+            if not self.time_called:
+                # A count from a test stopped at 12 s is not comparable to a 30 s norm,
+                # so the norm is not printed beside it.
+                reference = (f"Stopped at {total:.0f}s - not a 30-second score, so no "
+                             "reference is shown.")
+            elif self.final_counted:
+                reference = ("Includes a final stand more than halfway up at 30 s, "
+                             "as the protocol counts it.  " + reference)
             return (f"Chair stands: {self.stand_count}.  {reference}  "
                     f"Protocol: 43-45 cm chair against a wall, arms crossed at the chest, "
                     f"full stand each rep - the app cannot check this.  "
@@ -906,7 +962,8 @@ class Main(QtWidgets.QMainWindow):
             writer.writerow(["mediapipe", mediapipe_version()])
             writer.writerow(["best_rom", f"{best:.0f}°", "best_joint", best_joint])
             if rec["chair"]:
-                writer.writerow(["stands", self.stand_count])
+                writer.writerow(["stands", self.stand_count,
+                                 "complete", "yes" if self.time_called else "no"])
                 writer.writerow(["age", rec["age"], "sex", rec["sex"]])
                 writer.writerow(["reference", chair_stand_norm(rec["age"], rec["sex"])])
             framing = 100.0 * self.setup_ok / max(self.frames, 1)

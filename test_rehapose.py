@@ -45,10 +45,13 @@ def main():
     assert "rehaPoseTest" in rehapose.settings().fileName(), rehapose.settings().fileName()
     # Point the data dir at a scratch folder so the first-run chooser stays silent.
     tmp = tempfile.mkdtemp(prefix="rehapose-test-")
+    rehapose.settings().clear()           # last run's saved exercise must not leak in
     rehapose.settings().setValue("dataDir", tmp)
     assert rehapose.session_dir() == pathlib.Path(tmp) / "sessions"
 
     window = rehapose.Main(camera=0)
+    window.exercise.setCurrentIndex(window.exercise.findData("knee_flexion"))
+    window._snapshot()
 
     # Set up session state the way start() does, without touching the camera.
     window.t0 = 0.0
@@ -132,11 +135,18 @@ def main():
     window.sex.setCurrentText("female")
     window._snapshot()                # start() does this
     window.stand_count = 7
+    window.time_called = True
     line = window.verdict()
     assert "Chair stands: 7" in line and "14" in line, line
     assert "cannot check" in line, "protocol caveat missing from the result"
+    # Stopped by hand before 30 s: the count is not a score, so no norm beside it.
+    window.time_called = False
+    line = window.verdict()
+    assert "not a 30-second score" in line and "14" not in line, line
     for extra in rehapose.session_dir().glob("*.csv"):
         extra.unlink()
+
+    check_chair_stand(window, app, frame, poses)
 
     # A frame with no pose at all must not crash and must record a gap.
     window.on_frame(frame.copy(), (None, None), 7.0)
@@ -144,6 +154,51 @@ def main():
 
     check_shell(window, tmp, frame, poses)
     print(f"smoke test passed ({detected}/30 frames tracked)")
+
+
+def check_chair_stand(window, app, frame, poses):
+    """Countdown, then measure, then time is called with the final-stand rule applied."""
+    import time
+    kept = window.times, window.angles, window.stands
+    window._snapshot()
+    window.times = {j: [] for j in JOINTS}
+    window.angles = {j: [] for j in JOINTS}
+    window.stands, window.stand_count, window.clock_start = [], 0, None
+    window.counted, window.time_called, window.final_counted = None, False, False
+    window.frames = window.setup_ok = 0
+    window.on_frame(frame.copy(), poses[0], 7.0)
+    assert window.clock_start > time.perf_counter(), "no countdown before a scored test"
+    assert "starting in 3" in window.status.text(), window.status.text()
+    assert window.counted == 3 and not window.measured, "countdown frames were recorded"
+    assert window.frames == 0, "countdown frames counted towards framing"
+
+    window.clock_start = window.t0 = time.perf_counter() - 1.0      # countdown over
+    window.on_frame(frame.copy(), poses[0], 7.0)
+    assert window.measured and window.counted == 0
+
+    # Three full stands and a rise past halfway, then time is called.
+    window.stands = []
+    for _ in range(3):
+        window.stands += list(np.linspace(90, 5, 12)) + list(np.linspace(5, 90, 12))
+    window.stands += list(np.linspace(90, 40, 6))
+    window.worker = FakeWorker()
+    window.t0 = time.perf_counter() - analysis.CHAIR_STAND_SECONDS - 1.0
+    window.on_frame(frame.copy(), (None, None), 7.0)   # a gap, so the rise stays last
+    app.processEvents()
+    assert window.worker is None, "time ran out but the session kept recording"
+    assert window.stand_count == 4 and window.final_counted, window.stand_count
+    assert "more than halfway" in window.status.text(), window.status.text()
+    saved = sorted(rehapose.session_dir().glob("*-chair_stand_30s.csv"))[-1]
+    head = rehapose.read_header(saved)
+    assert head["stands"] == "4" and head["complete"] == "yes", head
+
+    # And History brings the stand count back, not just the joint table.
+    window.show_history()
+    window.open_stored(window.sessions.item(0, 0))
+    assert "Chair stands: 4" in window.status.text(), window.status.text()
+    for extra in rehapose.session_dir().glob("*.csv"):
+        extra.unlink()
+    window.times, window.angles, window.stands = kept
 
 
 class FakeWorker:
@@ -247,8 +302,9 @@ def check_shell(window, tmp, frame, poses):
     assert head["best_joint"].replace("_", " ") in window.sessions.item(0, 3).text()
     # The degree sign decodes as U+FFFD; the number, which is what matters, survives.
     assert any(c.isdigit() for c in window.sessions.item(2, 3).text()), "cp1252 row lost"
+    viewing = window.viewing_stored
     window.open_stored(window.sessions.item(1, 0))      # junk: a warning, not a crash
-    assert window.viewing_stored is None
+    assert window.viewing_stored == viewing, "a refused file still took over the view"
     mangled.unlink()
     junk.unlink()
     window.show_history()

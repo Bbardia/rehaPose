@@ -284,6 +284,21 @@ CHAIR_STAND_NORMS = {
 }
 
 
+def chair_stand_score(knee, lo=CHAIR_STAND_LO, hi=CHAIR_STAND_HI):
+    """(stands, final_counted) when time is called.
+
+    The published protocol counts a final stand if the participant is more than halfway
+    up at 30 s. Without that rule the count sits one below the protocol the norms were
+    built on, for anyone caught mid-rise. "Halfway" is the knee-angle midpoint of the two
+    thresholds - ponytail: knee angle is not linear in seat height, but at 45 deg between
+    a 70 deg seat and a 20 deg stand the rise is well past its halfway point either way.
+    """
+    spans = rep_spans(knee, lo=lo, hi=hi)
+    tail = [v for v in knee[spans[-1][1] if spans else 0:] if v is not None]
+    final = bool(tail) and max(tail) >= hi and tail[-1] <= (lo + hi) / 2
+    return len(spans) + final, final
+
+
 def chair_stand_norm(age, sex):
     """Reference number of stands, or None if the age is outside the published table."""
     for (low, high), (women, men) in CHAIR_STAND_NORMS.items():
@@ -362,6 +377,16 @@ def demo():
     assert count_reps(half, lo=CHAIR_STAND_LO, hi=CHAIR_STAND_HI) == 0
     # ...and the self-calibrating default is exactly what gets it wrong:
     assert count_reps(half) == 10
+
+    # Final-stand rule: more than halfway up at 30 s counts, less does not, and a
+    # participant already standing when time is called gets nothing extra.
+    three = full[:90]                                      # 3 stands, ends seated at 90
+    assert chair_stand_score(three) == (3, False)
+    assert chair_stand_score(three + list(np.linspace(90, 40, 8))) == (4, True)
+    assert chair_stand_score(three + list(np.linspace(90, 55, 8))) == (3, False)
+    assert chair_stand_score(three + list(np.linspace(90, 5, 15))) == (4, False)
+    assert chair_stand_score(list(np.linspace(90, 40, 8))) == (1, True)  # first rise
+    assert chair_stand_score([None, None]) == (0, False)
 
     assert chair_stand_norm(72, "female") == 14
     assert chair_stand_norm(72, "male") == 15
