@@ -36,3 +36,15 @@ jobs:
       - run: python test_rehapose.py
         env:
           QT_QPA_PLATFORM: offscreen
+          REHAPOSE_ARTIFACTS: ${{ runner.temp }}/artifacts
+      - run: python test_e2e.py
+        env:
+          QT_QPA_PLATFORM: offscreen
+          REHAPOSE_ARTIFACTS: ${{ runner.temp }}/artifacts
+      - if: failure()  # screenshots and session files of the failing run
+        uses: actions/upload-artifact@v7
+        with:
+          name: failure-${{ matrix.os }}
+          path: ${{ runner.temp }}/artifacts
+          if-no-files-found: ignore
+          retention-days: 7

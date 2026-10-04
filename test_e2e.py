@@ -122,6 +122,9 @@ def app_on(clip, exercise, tmp, name, gui_delay=0.0, **patches):
                                     folder=pathlib.Path(tmp) / name / "sessions")
         try:
             yield run
+        except BaseException:
+            save_artifacts(f"e2e-{name}", tmp)  # before shut_down closes the window
+            raise
         finally:
             shut_down(window)
 
@@ -137,6 +140,7 @@ def shut_down(window):
     window.worker = None
     window.close()
     window.deleteLater()
+    QtCore.QCoreApplication.sendPostedEvents(None, QtCore.QEvent.DeferredDelete)  # qWait won't
     QtTest.QTest.qWait(50)
 
 
@@ -300,6 +304,8 @@ def main():
         print(f"  ok  {scenario.__name__:26} {time.monotonic() - t:5.1f} s")
     peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (2**20 if sys.platform == "darwin"
                                                                  else 2**10)
+    left = [w for w in QtWidgets.QApplication.topLevelWidgets() if isinstance(w, rehapose.Main)]
+    assert not left, f"{len(left)} windows were never deleted"
     print(f"e2e passed ({len(SCENARIOS)} scenarios, {time.monotonic() - started:.0f} s, "
           f"peak {peak:.0f} MB)")
 

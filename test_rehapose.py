@@ -83,8 +83,10 @@ def save_artifacts(name, tmp):
         return
     dest = pathlib.Path(out) / name
     dest.mkdir(parents=True, exist_ok=True)
-    for i, widget in enumerate(QtWidgets.QApplication.topLevelWidgets()):
-        widget.grab().save(str(dest / f"window-{i}.png"))
+    windows = [w for w in QtWidgets.QApplication.topLevelWidgets()
+               if isinstance(w, QtWidgets.QMainWindow)]
+    for i, window in enumerate(windows):
+        window.grab().save(str(dest / f"window-{i}.png"))
     shutil.copytree(tmp, dest / "data", dirs_exist_ok=True)
     (dest / "record.txt").write_text(f"{RECORD.dialogs}\n{RECORD.tones}\n{RECORD.errors}\n")
 
