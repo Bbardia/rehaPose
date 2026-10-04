@@ -10,16 +10,16 @@ jobs:
       fail-fast: false
       matrix:
         # macOS arm64 is where every native failure so far happened; Ubuntu proves Linux x64.
-        os: [macos-14, ubuntu-latest]
+        os: [macos-14, ubuntu-24.04]  # pinned, so a runner image change is a commit
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15   # a modal dialog offscreen hangs forever; fail instead
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.11"
           cache: pip
-      - uses: actions/cache@v4
+      - uses: actions/cache@v5
         with:
           path: ~/.cache/rehapose
           key: rehapose-models-${{ matrix.os }}-${{ hashFiles('capture.py') }}
