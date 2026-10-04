@@ -1,10 +1,13 @@
 """Headless UI smoke test: QT_QPA_PLATFORM=offscreen python test_rehapose.py"""
+import faulthandler
 import os
 import pathlib
 import shutil
 import sys
 import tempfile
 import time
+import traceback
+import types
 
 import cv2
 import numpy as np
@@ -16,12 +19,14 @@ import capture
 import rehapose
 import storage
 from analysis import JOINTS
-from PyQt5 import QtCore, QtGui, QtWidgets
+from PyQt5 import QtCore, QtGui, QtMultimedia, QtWidgets
 
 
 # Pinned to a commit: "main" of an unmaintained repo can move or vanish under the test.
 SAMPLE_URL = ("https://raw.githubusercontent.com/open-mmlab/mmpose/"
               "ec2f372f002d1d534ea01a13033d09f5483256db/tests/data/coco/000000000785.jpg")
+RECORD = types.SimpleNamespace(dialogs=[], tones=[], errors=[])
+TONE_NAMES = {f"tone-{f}-{ms}": name for name, (f, ms) in rehapose.TONES.items()}
 
 
 def sample_frame():
@@ -34,28 +39,78 @@ def sample_frame():
     return cv2.resize(cv2.imread(str(path)), (1280, 720))
 
 
-def main():
-    analysis.demo()
+def upper_body_frame():
+    """Head to hips of the sample photo: a stand-in for someone seated at a laptop."""
+    sample_frame()  # caches the photo
+    photo = cv2.imread(str(rehapose.MODEL_DIR / "sample_person.jpg"))
+    return cv2.resize(photo[0:240, 160:587], (1280, 720))
 
-    app = QtWidgets.QApplication(sys.argv)
+
+def sandbox(name):
+    """Settings, data, dialogs, tones and slot errors all kept inside one temp folder."""
+    faulthandler.enable()
+    faulthandler.dump_traceback_later(300, exit=True)  # a hang dumps stacks, not 15 silent min
+    tmp = tempfile.mkdtemp(prefix=f"rehapose-{name.lower()}-")
+    QtCore.QSettings.setDefaultFormat(QtCore.QSettings.IniFormat)
+    QtCore.QSettings.setPath(QtCore.QSettings.IniFormat, QtCore.QSettings.UserScope, tmp)
+    QtCore.QStandardPaths.setTestModeEnabled(True)
+    app = QtWidgets.QApplication(sys.argv[:1])
     app.setOrganizationName("rehaPose")
-    app.setApplicationName("rehaPoseTest")     # never touch the real preferences
-    assert "rehaPoseTest" in rehapose.settings().fileName(), rehapose.settings().fileName()
-    # Modal dialogs block forever offscreen: stub them so a regression fails, not hangs.
-    QtWidgets.QMessageBox.critical = staticmethod(lambda *_a, **_k: None)
-    QtWidgets.QMessageBox.warning = staticmethod(lambda *_a, **_k: None)
-    QtWidgets.QMessageBox.information = staticmethod(lambda *_a, **_k: None)
+    app.setApplicationName(f"rehaPose{name}")
+    assert storage.settings().fileName().startswith(tmp), storage.settings().fileName()
+    storage.LEGACY_SESSIONS = pathlib.Path(tmp) / "no-legacy"
+
+    def excepthook(*exc):  # a Qt-slot exception fails the run instead of aborting it
+        RECORD.errors.append("".join(traceback.format_exception(*exc)))
+        sys.__excepthook__(*exc)
+    sys.excepthook = excepthook
+
+    box = QtWidgets.QMessageBox
+    for kind in ("critical", "warning", "information", "about", "question"):
+        setattr(box, kind, staticmethod(lambda *a, _kind=kind, **_k: RECORD.dialogs.append(
+            (_kind, a[2] if len(a) > 2 else "")) or box.Cancel))
     QtWidgets.QFileDialog.getExistingDirectory = staticmethod(lambda *_a, **_k: "")
     QtWidgets.QFileDialog.getSaveFileName = staticmethod(lambda *_a, **_k: ("", ""))
-    tmp = tempfile.mkdtemp(prefix="rehapose-test-")
+    QtMultimedia.QSoundEffect.play = lambda self: RECORD.tones.append(
+        TONE_NAMES.get(pathlib.Path(self.source().toLocalFile()).stem, "?"))
+    return app, tmp
+
+
+def save_artifacts(name, tmp):
+    """On failure: every window as a PNG plus the run's data folder, for CI to upload."""
+    out = os.environ.get("REHAPOSE_ARTIFACTS")
+    if not out:
+        return
+    dest = pathlib.Path(out) / name
+    dest.mkdir(parents=True, exist_ok=True)
+    for i, widget in enumerate(QtWidgets.QApplication.topLevelWidgets()):
+        widget.grab().save(str(dest / f"window-{i}.png"))
+    shutil.copytree(tmp, dest / "data", dirs_exist_ok=True)
+    (dest / "record.txt").write_text(f"{RECORD.dialogs}\n{RECORD.tones}\n{RECORD.errors}\n")
+
+
+class NoWorker:
+    """The smoke test never starts a real camera thread: test_e2e.py does that."""
+
+    def __init__(self, *_a):
+        raise AssertionError("the smoke test started a real PoseWorker")
+
+
+def main():
+    analysis.demo()
+    app, tmp = sandbox("Test")
     try:
         run(app, tmp)
+        assert not RECORD.errors, RECORD.errors[0]
+    except BaseException:
+        save_artifacts("smoke", tmp)
+        raise
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
 
 def run(app, tmp):
-    rehapose.settings().clear()           # last run's saved exercise must not leak in
+    rehapose.PoseWorker = NoWorker
     rehapose.settings().setValue("dataDir", tmp)
     assert rehapose.session_dir() == pathlib.Path(tmp) / "sessions"
 
@@ -70,11 +125,13 @@ def run(app, tmp):
     window.angles = {j: [] for j in JOINTS}
     window.filters = {j: analysis.OneEuro() for j in JOINTS}
 
-    frame, poses = track_sample()
+    frame = sample_frame()
+    poses = track(frame, "lite", 30)
     detected = sum(1 for _, w in poses if w is not None)
     assert detected > 0, "MediaPipe found no pose in the sample photo"
 
     check_orientation(frame, poses)
+    check_real_gate(window)
     check_overlay()
     check_setup_gate(window, app, frame, poses)
     check_autosave(window)
@@ -88,56 +145,52 @@ def run(app, tmp):
     print(f"smoke test passed ({detected}/30 frames tracked)")
 
 
-def track_sample():
-    """The sample photo and 30 (pixel, world) landmark pairs from the lite model."""
+def track(frame, tier, n):
+    """n (pixel, world) landmark pairs for a still frame, through the real model in VIDEO mode."""
     import mediapipe as mp
     from mediapipe.tasks import python as mpp
     from mediapipe.tasks.python import vision
 
-    path = capture.ensure_model("lite")
     landmarker = vision.PoseLandmarker.create_from_options(
         vision.PoseLandmarkerOptions(
-            base_options=mpp.BaseOptions(model_asset_path=str(path)),
+            base_options=mpp.BaseOptions(model_asset_path=str(capture.ensure_model(tier))),
             running_mode=vision.RunningMode.VIDEO, num_poses=1))
-
-    frame = sample_frame()
-    image = mp.Image(image_format=mp.ImageFormat.SRGB,
-                     data=cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-
+    image = mp.Image(image_format=mp.ImageFormat.SRGB, data=cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
     poses = []
-    for i in range(30):
+    for i in range(n):
         res = landmarker.detect_for_video(image, (i + 1) * 33)
-        world = res.pose_world_landmarks[0] if res.pose_world_landmarks else None
-        pixel = res.pose_landmarks[0] if res.pose_landmarks else None
-        poses.append((pixel, world))
+        poses.append((res.pose_landmarks[0] if res.pose_landmarks else None,
+                      res.pose_world_landmarks[0] if res.pose_world_landmarks else None))
     landmarker.close()
-    return frame, poses
+    return poses
 
 
 def check_orientation(frame, poses):
-    import mediapipe as mp
-    from mediapipe.tasks import python as mpp
-    from mediapipe.tasks.python import vision
-
     pixel, world = poses[-1]
     cos = analysis.orientation_cos(pixel, world, frame.shape[1], frame.shape[0])
     assert cos is not None and 0.0 <= cos <= 1.0, cos
     # The mirrored photo must read nearly the same turn on heavy (shoulders alone failed).
-    turns = []
-    for image_bgr in (frame, cv2.flip(frame, 1)):
-        heavy = vision.PoseLandmarker.create_from_options(
-            vision.PoseLandmarkerOptions(
-                base_options=mpp.BaseOptions(model_asset_path=str(capture.ensure_model(
-                    "heavy"))), running_mode=vision.RunningMode.VIDEO, num_poses=1))
-        still = mp.Image(image_format=mp.ImageFormat.SRGB,
-                         data=cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB))
-        for i in range(15):
-            res = heavy.detect_for_video(still, (i + 1) * 33)
-        heavy.close()
-        turns.append(analysis.orientation_cos(res.pose_landmarks[0],
-                                              res.pose_world_landmarks[0],
-                                              frame.shape[1], frame.shape[0]))
+    w, h = frame.shape[1], frame.shape[0]
+    turns = [analysis.orientation_cos(*track(image, "heavy", 15)[-1], w, h)
+             for image in (frame, cv2.flip(frame, 1))]
     assert abs(turns[0] - turns[1]) < 0.15, turns
+
+
+def check_real_gate(window):
+    crop = upper_body_frame()
+    for tier in ("lite", "heavy"):
+        poses = track(crop, tier, rehapose.SETUP_HOLD + 3)
+        for key, starts in (("knee_flexion", True), ("shoulder_abduction", True),
+                            ("other", True), ("chair_stand_30s", False)):
+            window.exercise.setCurrentIndex(window.exercise.findData(key))
+            window._snapshot()
+            window._reset_session()
+            for pair in poses:
+                window.on_frame(crop.copy(), pair, 7.0)
+            assert (window.clock_start is not None) == starts, (tier, key, window.status.text())
+    window.exercise.setCurrentIndex(window.exercise.findData("knee_flexion"))
+    window._snapshot()
+    window._reset_session()
 
 
 def check_overlay():
@@ -192,7 +245,7 @@ def check_setup_gate(window, app, frame, poses):
     assert len(window.stands) == 30
     assert "Turn side-on" in window.status.text(), "framing advice not shown while recording"
     assert (window.frames, window.setup_ok) == (30, 0), "badly framed frames counted as good"
-    rehapose.setup_check = lambda *_a, **_k: (True, "Setup looks good.")
+    rehapose.setup_check = analysis.setup_check
 
 
 def check_autosave(window):
@@ -276,9 +329,11 @@ def check_time_called(window, app, frame):
     window.stands += list(np.linspace(90, 40, 6))
     window.worker = FakeWorker()
     window.t0 = time.perf_counter() - analysis.CHAIR_STAND_SECONDS - 1.0
+    RECORD.tones.clear()
     window.on_frame(frame.copy(), (None, None), 7.0)   # a gap, so the rise stays last
     app.processEvents()
     assert window.worker is None, "time ran out but the session kept recording"
+    assert RECORD.tones.count("end") == 1 and RECORD.tones[-1] == "end", RECORD.tones
     assert window.stand_count == 4 and window.final_counted, window.stand_count
     assert "more than halfway" in window.status.text(), window.status.text()
     saved = sorted(rehapose.session_dir().glob("*-chair_stand_30s.csv"))[-1]
@@ -395,6 +450,7 @@ def check_failed_save(window, tmp):
 def check_unsaved_guard(window, tmp, blocker):
     box = QtWidgets.QMessageBox
     box.question = staticmethod(lambda *_a, **_k: box.Cancel)
+    rehapose.settings().setValue("dataDir", tmp)  # folder back, so only the unsaved guard refuses
     window.start()
     assert window.worker is None, "Start discarded an unsaved session"
     closing = QtGui.QCloseEvent()
