@@ -1,36 +1,32 @@
-"""Mirror-gap error floor: python mirror_check.py clip.mp4 [--tier heavy|lite|both]"""
+"""Mirror-gap error floor: python mirror_check.py clip.mp4 [--backend rtmpose] [--tier x]"""
 import argparse
 
 import cv2
 import numpy as np
 
 from analysis import JOINTS, flexion, visible
-from capture import TIERS, ensure_model
+from capture import (RTM_FILES, RTM_TIERS, TIERS, MediaPipeModel, RTMPoseModel, ensure_model,
+                     ensure_rtm, rtm_device)
 
 
-def landmarker(tier):
-    from mediapipe.tasks import python as mpp
-    from mediapipe.tasks.python import vision
-    return vision.PoseLandmarker.create_from_options(vision.PoseLandmarkerOptions(
-        base_options=mpp.BaseOptions(model_asset_path=str(ensure_model(tier))),
-        running_mode=vision.RunningMode.VIDEO, num_poses=1))
+def make_model(backend, tier):
+    """The app's own model adapter, so this measures exactly what the app runs."""
+    if backend == "rtmpose":
+        return RTMPoseModel(ensure_rtm("det"), ensure_rtm(tier), RTM_FILES[tier][2],
+                            rtm_device() or "cpu")
+    return MediaPipeModel(ensure_model(tier))
 
 
-def angles(result):
-    if not result.pose_world_landmarks:
+def angles(pixel, world):
+    if world is None:
         return {}
-    world, pixel = result.pose_world_landmarks[0], result.pose_landmarks[0]
     return {j: flexion(world, j) for j in JOINTS if visible(pixel, j)}
 
 
-def mirrored_pair(mp, straight, mirrored, frame, stamp):
-    """Angles from one frame and from its mirror image, each through its own landmarker."""
-    pair = []
-    for model, image in ((straight, frame), (mirrored, cv2.flip(frame, 1))):
-        rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        pair.append(angles(model.detect_for_video(
-            mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb), stamp)))
-    return pair
+def mirrored_pair(straight, mirrored, frame, stamp):
+    """Angles from one frame and from its mirror image, each through its own model."""
+    return [angles(*model(image, stamp))
+            for model, image in ((straight, frame), (mirrored, cv2.flip(frame, 1)))]
 
 
 def pair_gaps(a, b):
@@ -42,16 +38,15 @@ def pair_gaps(a, b):
             yield family, abs(a[joint] - b[twin])
 
 
-def mirror_gaps(path, tier):
-    """{joint family: [abs gap per frame]} for one tier over the whole clip."""
-    import mediapipe as mp
+def mirror_gaps(path, backend, tier):
+    """{joint family: [abs gap per frame]} for one model tier over the whole clip."""
     cap = cv2.VideoCapture(str(path))
     if not cap.isOpened():
         raise SystemExit(f"cannot open {path}")
     fps = cap.get(cv2.CAP_PROP_FPS)
     # Bogus fps (0, NaN, 90000) would repeat ms stamps, which VIDEO mode rejects.
     fps = fps if 0 < fps <= 1000 else 30.0
-    straight, mirrored = landmarker(tier), landmarker(tier)
+    straight, mirrored = make_model(backend, tier), make_model(backend, tier)
     gaps = {j.split("_", 1)[1]: [] for j in JOINTS}
     frames = 0
     try:
@@ -61,7 +56,7 @@ def mirror_gaps(path, tier):
                 break
             stamp = int(frames * 1000 / fps) + 1
             frames += 1
-            a, b = mirrored_pair(mp, straight, mirrored, frame, stamp)
+            a, b = mirrored_pair(straight, mirrored, frame, stamp)
             for family, gap in pair_gaps(a, b):
                 gaps[family].append(gap)
     finally:
@@ -74,12 +69,16 @@ def mirror_gaps(path, tier):
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("clip")
-    parser.add_argument("--tier", choices=(*TIERS, "both"), default="both")
+    parser.add_argument("--backend", choices=("mediapipe", "rtmpose"), default="mediapipe")
+    parser.add_argument("--tier", choices=(*TIERS, *RTM_TIERS, "all"), default="all")
     args = parser.parse_args()
-    tiers = TIERS if args.tier == "both" else (args.tier,)
+    own = RTM_TIERS if args.backend == "rtmpose" else TIERS
+    if args.tier not in (*own, "all"):
+        parser.error(f"--tier {args.tier} is not a {args.backend} tier: {', '.join(own)}")
+    tiers = own if args.tier == "all" else (args.tier,)
     print(f"{'tier':6} {'joint':9} {'pairs':>6} {'median':>8} {'p90':>8}   (degrees)")
     for tier in tiers:
-        gaps, frames = mirror_gaps(args.clip, tier)
+        gaps, frames = mirror_gaps(args.clip, args.backend, tier)
         for family, values in gaps.items():
             if values:
                 med, p90 = np.percentile(values, [50, 90])
