@@ -38,6 +38,21 @@ grant it to the terminal in System Settings → Privacy & Security → Camera.
 
 If the wrong camera opens: `python rehapose.py --camera 1`.
 
+### Optional: the more accurate model (RTMPose, 2D)
+
+```bash
+.venv/bin/pip install onnxruntime==1.30.0 tqdm      # NVIDIA GPU: onnxruntime-gpu==1.30.0
+.venv/bin/pip install --no-deps rtmlib==0.0.16      # --no-deps, see below
+```
+
+Then pick it under **Model → RTMPose**. It is OpenMMLab's RTMPose model family — from the
+same toolbox as the original MMPose version — running through ONNX Runtime, so there is
+still nothing to compile. `--no-deps` matters: rtmlib asks for `opencv-python`, which would install a second,
+conflicting OpenCV next to the one MediaPipe brings (`pip check` will mention it; that is
+expected). The first time it runs, it downloads its models once (about 275 MB), each pinned
+and checked against a SHA-256 like the MediaPipe ones. It runs on an NVIDIA GPU (CUDA), on
+an Apple Silicon GPU (CoreML) or on the CPU, and the Model menu says which it found.
+
 ## Use
 
 Pick an exercise, press **Start** (or `Cmd+R`), move, press **Stop**. The session is saved
@@ -148,9 +163,15 @@ and the gap is its own inconsistency:
 That is one photograph, not a validation study, and the arms in it are ambiguous — which
 is exactly why the elbow number is what it is. Treat it as a floor on the error, not a
 spec. It is also front-on, in single-image mode, while the app records side-on in video
-mode. `python mirror_check.py clip.mp4` runs the same test over every frame of a
-recorded side-on clip, per tier, in the mode the app actually uses — that is the number
-to quote once a clip exists.
+mode. `python mirror_check.py clip.mp4 [--backend rtmpose]` runs the same test over every
+frame of a recorded side-on clip, per model size, through the app's own model code — that
+is the number to quote once a clip exists.
+
+A first look at the two models, on a still clip of that same photo (median mirror gap):
+MediaPipe heavy knee 3.3° / hip 11.4° / elbow 32.0° / shoulder 18.3°; RTMPose-x 1.5° /
+1.5° / 2.2° / 1.5°. That says RTMPose places keypoints far more consistently. It does not
+yet say its angles are more *accurate*: mirroring is an exact 2D operation, so this test
+flatters 2D models, and a 2D angle is only right when the movement is square to the camera.
 
 **What it is fair to say:** counts and durations are dependable, because a chair stand
 only requires detecting that a large knee excursion crossed a threshold, not knowing
@@ -190,14 +211,32 @@ Left and right knee, hip, elbow and shoulder.
 
 ## How the backend is chosen
 
-There is one pose library (MediaPipe) with two model sizes, and the app picks between
-them by **measuring itself**, not by inspecting your hardware:
+**Model** menu, saved between sessions and locked while recording:
 
-- Starts on `heavy`, the larger model. (Whether it is the more *accurate* one is open:
-  on the one mirror-test photo above, `lite` was more self-consistent on every joint.
-  `mirror_check.py` on a real clip is what settles the default.)
+- **MediaPipe — 3D** (default; always installed). Angles come from metric 3D landmarks, so
+  they degrade gracefully when the camera is not square to the movement, and the app can
+  tell you when you are turned the wrong way.
+- **RTMPose — 2D, most accurate keypoints** (optional install above; the default on a
+  machine with an NVIDIA GPU). Steadier keypoints, but its angles are measured **as the
+  camera sees them**: correct when the movement is square to the camera — side-on for
+  bending, facing it for abduction — and wrong when it is not. It has no depth, so it
+  cannot warn you about the camera angle; framing advice is limited to what is in frame.
+
+Every session file records which model (and which GPU or CPU) produced it, and History
+has a Model column. Compare like with like: a 2D and a 3D angle of the same knee are not
+the same number.
+
+Within either model the app picks the size by **measuring itself**, not by inspecting
+your hardware. MediaPipe has `heavy` and `lite`; RTMPose has `x`, `m` and `s` (all behind
+one small person detector). Measured on an M4: RTMPose-x 31 ms per frame on the Apple GPU
+and 88 ms on the CPU, `m` 32 ms on the CPU. The CUDA path has not been run on an NVIDIA
+machine yet.
+
+- Starts on the largest model (`heavy`, or RTMPose `x`). (Whether the larger MediaPipe
+  model is the more *accurate* one is open: on the one mirror-test photo above, `lite` was
+  more self-consistent on every joint. `mirror_check.py` on a real clip settles it.)
 - For the first 5 seconds *after it first sees you*, it times its own inference.
-- If the median is slower than 40 ms it drops to `lite` and says so in the status bar.
+- If the median is slower than 40 ms it drops a size and says so in the status bar.
 - After that the choice is locked for the session.
 
 It only ever ratchets downward, and only in the first few seconds, because switching
@@ -226,12 +265,10 @@ possible:
 The evidence was already in this repo: the old `.venv` had `mmcv` installed but its
 compiled `_ext` missing, which is why `Body_Joint.py` never ran on this machine.
 
-So the default model is now MediaPipe `heavy`, auto-selected, with nothing to install.
-If you ever need RTMPose or ViTPose specifically, the escape hatch is one line —
-`pip install rtmlib` — which pulls them as ONNX with no compilation. It is not used here
-because it returns 2D pixel keypoints only, and this app measures angles from **metric 3D
-world landmarks**, which degrade more gracefully off-axis. They do still degrade, which is
-why there is a setup gate and why the numbers above are what they are.
+So the default model is MediaPipe, with nothing to install, and the OpenMMLab models come
+back as the optional RTMPose backend above: the same family, exported to ONNX by OpenMMLab
+and run through rtmlib and ONNX Runtime, so nothing is compiled and nothing depends on
+mmcv or torch.
 
 ## Checks
 
@@ -241,7 +278,7 @@ git config core.hooksPath githooks   # once per clone: the checks below run on c
 
 githooks/pre-commit                  # ~10 s, every commit: lint, maths self-check, UI smoke test
 githooks/pre-push                    # ~35 s, every push: all of that, then the e2e scenarios
-python mirror_check.py clip.mp4      # mirror consistency on a real clip
+python mirror_check.py clip.mp4      # mirror consistency on a real clip (--backend rtmpose)
 radon cc -s -a *.py                  # complexity
 ```
 
