@@ -3,15 +3,18 @@ import base64
 import contextlib
 import hashlib
 import importlib.metadata
+import io
 import shutil
 import time
 import urllib.request
+import zipfile
 from pathlib import Path
 
 import cv2
+import numpy as np
 from PyQt5 import QtCore
 
-from analysis import TierRatchet
+from analysis import TierRatchet, from_coco17
 
 # Model cache stays in ~/.cache: it is re-downloadable, unlike sessions.
 MODEL_DIR = Path.home() / ".cache" / "rehapose"
@@ -21,6 +24,20 @@ MODEL_URL = ("https://storage.googleapis.com/mediapipe-models/pose_landmarker/"
 MODEL_MD5 = {"heavy": "RT3sTQLMxNPOgStt6E+lFg==", "lite": "BKdd33yBGsehpFIyZt19iA=="}
 # Two tiers: the ratchet only asks whether this machine can sustain heavy.
 TIERS = ("heavy", "lite")
+# Optional RTMPose (2D) tiers, most accurate first; one small detector serves all of them.
+RTM_TIERS = ("x", "m", "s")
+RTM_URL = "https://download.openmmlab.com/mmpose/v1/projects/rtmposev1/onnx_sdk/"
+RTM_MIRROR = "https://huggingface.co/Tau-J/RTMPose/resolve/main/rtmposev1/onnx_sdk/"
+RTM_FILES = {  # name: (zip under RTM_URL, sha256 of its end2end.onnx, model input w x h)
+    "det": ("yolox_tiny_8xb8-300e_humanart-6f3252f9.zip",
+            "ceb11c07298f95c50d7c5abeb906d03340c85f23aa79e3e66966e7fb6c307250", (416, 416)),
+    "x": ("rtmpose-x_simcc-body7_pt-body7_700e-384x288-71d7b7e9_20230629.zip",
+          "df0c0fa91e9870b1515dcaff741fd76cc753dcfb12786862f61b243bae81cd52", (288, 384)),
+    "m": ("rtmpose-m_simcc-body7_pt-body7_420e-256x192-e48f03d0_20230504.zip",
+          "5c0a4bf67953e6d2ac43ce15e77dc9d5d354ae18430a47d2c5963a7bc5683e3c", (192, 256)),
+    "s": ("rtmpose-s_simcc-body7_pt-body7_420e-256x192-acd4a1ef_20230504.zip",
+          "9aeb635b83f86aea45cf45d85798f7eba1a162de8e0d721c44e54fe5eebaf47d", (192, 256)),
+}
 BUDGET_MS = 40.0    # 25 fps inference, room left for camera + plots
 RATCHET_S = 5.0     # seconds of detected pose before the tier locks
 
@@ -47,6 +64,101 @@ def ensure_model(tier):
     return path
 
 
+def sha256_of(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def ensure_rtm(name):
+    """Path of a pinned RTMPose-family ONNX model, fetched and checked like the MediaPipe ones."""
+    zip_name, sha, _size = RTM_FILES[name]
+    MODEL_DIR.mkdir(parents=True, exist_ok=True)
+    path = MODEL_DIR / f"rtm-{name}.onnx"
+    if path.exists() and sha256_of(path) != sha:
+        path.unlink()
+    if not path.exists():
+        tmp = path.with_suffix(".part")
+        for base in (RTM_URL, RTM_MIRROR):  # the mirror only if OpenMMLab's server is down
+            try:
+                with urllib.request.urlopen(base + zip_name, timeout=30) as response:
+                    archive = zipfile.ZipFile(io.BytesIO(response.read()))
+                break
+            except OSError:
+                if base == RTM_MIRROR:
+                    raise
+        tmp.write_bytes(archive.read(next(n for n in archive.namelist()
+                                          if n.endswith("end2end.onnx"))))
+        if sha256_of(tmp) != sha:
+            tmp.unlink()
+            raise RuntimeError(f"The RTMPose {name} model download was corrupted - try again.")
+        tmp.rename(path)
+    return path
+
+
+def rtm_device():
+    """Where RTMPose runs: 'cuda' (NVIDIA), 'mps' (Apple CoreML) or 'cpu'; None if not installed."""
+    try:
+        import onnxruntime
+        import rtmlib  # noqa: F401
+    except ImportError:
+        return None
+    providers = onnxruntime.get_available_providers()
+    if "CUDAExecutionProvider" in providers:
+        return "cuda"
+    return "mps" if "CoreMLExecutionProvider" in providers else "cpu"
+
+
+class MediaPipeModel:
+    """MediaPipe pose in VIDEO mode: 3D world landmarks in metres."""
+
+    def __init__(self, path):
+        import mediapipe as mp
+        from mediapipe.tasks import python as mpp
+        from mediapipe.tasks.python import vision
+        self.mp, self.stamp = mp, 0
+        self.landmarker = vision.PoseLandmarker.create_from_options(
+            vision.PoseLandmarkerOptions(
+                base_options=mpp.BaseOptions(model_asset_path=str(path)),
+                running_mode=vision.RunningMode.VIDEO,
+                num_poses=1))
+
+    def __call__(self, frame, stamp=None):
+        """(pixel, world) for one BGR frame, each None without a pose."""
+        self.stamp = self.stamp + 33 if stamp is None else stamp
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        res = self.landmarker.detect_for_video(
+            self.mp.Image(image_format=self.mp.ImageFormat.SRGB, data=rgb), self.stamp)
+        return (res.pose_landmarks[0] if res.pose_landmarks else None,
+                res.pose_world_landmarks[0] if res.pose_world_landmarks else None)
+
+    def close(self):
+        self.landmarker.close()
+
+
+class RTMPoseModel:
+    """RTMPose 2D keypoints behind a small person detector, in MediaPipe's landmark layout."""
+
+    def __init__(self, det_path, pose_path, pose_size, device):
+        from rtmlib import YOLOX, RTMPose
+        with contextlib.redirect_stdout(io.StringIO()):  # rtmlib prints every model it loads
+            # CoreML cannot run YOLOX (a static-shape error), so only CUDA moves the detector.
+            self.det = YOLOX(str(det_path), model_input_size=RTM_FILES["det"][2],
+                             backend="onnxruntime", device="cuda" if device == "cuda" else "cpu")
+            self.pose = RTMPose(str(pose_path), model_input_size=pose_size,
+                                backend="onnxruntime", device=device)
+
+    def __call__(self, frame, _stamp=None):
+        """(pixel, world) for one BGR frame, each None without a person; no clock needed."""
+        boxes = self.det(frame)
+        if len(boxes) == 0:
+            return None, None
+        keypoints, scores = self.pose(frame, bboxes=boxes)
+        best = int(np.argmax(scores.mean(axis=1)))  # the most confidently seen person
+        return from_coco17(keypoints[best], scores[best], frame.shape[1], frame.shape[0])
+
+    def close(self):
+        pass
+
+
 class PoseWorker(QtCore.QThread):
     """Camera capture + inference, off the GUI thread so the UI never stalls."""
 
@@ -55,23 +167,25 @@ class PoseWorker(QtCore.QThread):
     status = QtCore.pyqtSignal(str)
     failed = QtCore.pyqtSignal(str)
 
-    def __init__(self, camera=0):
+    def __init__(self, camera=0, backend="mediapipe"):
         super().__init__()
-        self.camera = camera
-        self.tier_log = [TIERS[0]]     # every tier this session ran on
+        self.camera, self.backend = camera, backend
+        self.tiers = RTM_TIERS if backend == "rtmpose" else TIERS
+        self.device = rtm_device() if backend == "rtmpose" else "cpu"
+        self.tier_log = [self.tiers[0]]  # every tier this session ran on
         self._stop = False
 
     def stop(self):
         self._stop = True
 
-    def _make(self, path):
-        from mediapipe.tasks import python as mpp
-        from mediapipe.tasks.python import vision
-        return vision.PoseLandmarker.create_from_options(
-            vision.PoseLandmarkerOptions(
-                base_options=mpp.BaseOptions(model_asset_path=str(path)),
-                running_mode=vision.RunningMode.VIDEO,
-                num_poses=1))
+    def _make(self, files):
+        return RTMPoseModel(*files, self.device) if self.backend == "rtmpose" else (
+            MediaPipeModel(files))
+
+    def _name(self, tier):
+        if self.backend == "rtmpose":
+            return f"RTMPose-{tier} 2D on {DEVICE_NAMES[self.device]}"
+        return f"MediaPipe {tier}"
 
     def _open_camera(self):
         cap = cv2.VideoCapture(self.camera)
@@ -92,12 +206,6 @@ class PoseWorker(QtCore.QThread):
             self.failed.emit(f"{type(exc).__name__}: {exc}")
 
     def _run(self):
-        try:
-            import mediapipe as mp
-        except ImportError:
-            self.failed.emit("mediapipe is not installed - see README")
-            return
-
         models = self._prepare_models()
         if models is None:
             return
@@ -105,10 +213,10 @@ class PoseWorker(QtCore.QThread):
         if cap is None:
             return
 
-        landmarker = self._make(models[TIERS[0]])
-        self.status.emit(f"Backend: MediaPipe {TIERS[0]}")
-        ratchet = TierRatchet(len(TIERS), budget_ms=BUDGET_MS, window_s=RATCHET_S)
-        stamp, misses = 0, 0
+        model = self._make(models[self.tiers[0]])
+        self.status.emit(f"Backend: {self._name(self.tiers[0])}")
+        ratchet = TierRatchet(len(self.tiers), budget_ms=BUDGET_MS, window_s=RATCHET_S)
+        misses = 0
 
         try:
             while not self._stop:
@@ -127,47 +235,49 @@ class PoseWorker(QtCore.QThread):
                     self.msleep(50)
                     continue
                 misses = 0
-                stamp += 33
-                world, dt = self._infer(mp, landmarker, frame, stamp)
+                world, dt = self._infer(model, frame)
 
                 tier = ratchet.update(dt, time.perf_counter(), world is not None)
                 if tier is not None:
-                    landmarker.close()
-                    landmarker = self._make(models[TIERS[tier]])
-                    self.tier_log.append(TIERS[tier])
-                    self.status.emit(
-                        f"Backend: MediaPipe {TIERS[tier]} (auto: too slow for "
-                        f"{TIERS[tier - 1]})")
+                    model.close()
+                    model = self._make(models[self.tiers[tier]])
+                    self.tier_log.append(self.tiers[tier])
+                    self.status.emit(f"Backend: {self._name(self.tiers[tier])} "
+                                     f"(auto: too slow for {self.tiers[tier - 1]})")
         finally:
             cap.release()
             with contextlib.suppress(Exception):
-                landmarker.close()
+                model.close()
 
     def _prepare_models(self):
-        """{tier: model path}, or None if Stop was pressed while fetching."""
+        """{tier: model files}, or None if Stop was pressed while fetching."""
+        if self.backend == "rtmpose" and self.device is None:
+            self.failed.emit("RTMPose is not installed - see README, 'More accurate model'.")
+            return None
         # Fetch every tier before the camera so a step-down never stalls the frame loop.
-        self.status.emit("Preparing models (the first run downloads about 36 MB)...")
+        if self.backend == "rtmpose":
+            self.status.emit("Preparing RTMPose models (the first run downloads ~275 MB)...")
+        else:
+            self.status.emit("Preparing models (the first run downloads about 36 MB)...")
         models = {}
-        for tier in TIERS:
+        for tier in self.tiers:
             if self._stop:
                 return None
-            models[tier] = ensure_model(tier)
+            models[tier] = ((ensure_rtm("det"), ensure_rtm(tier), RTM_FILES[tier][2])
+                            if self.backend == "rtmpose" else ensure_model(tier))
         return None if self._stop else models
 
-    def _infer(self, mp, landmarker, frame, stamp):
+    def _infer(self, model, frame):
         """One frame through the model and out to the UI; returns (world, inference ms)."""
         # Infer on the UNFLIPPED frame: mirroring first swaps every left_*/right_* label.
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-
         t0 = time.perf_counter()
-        res = landmarker.detect_for_video(image, stamp)
+        pixel, world = model(frame)
         dt = (time.perf_counter() - t0) * 1000.0
-
-        world = res.pose_world_landmarks[0] if res.pose_world_landmarks else None
-        pixel = res.pose_landmarks[0] if res.pose_landmarks else None
         self.ready.emit(frame, (pixel, world), dt)
         return world, dt
+
+
+DEVICE_NAMES = {"cuda": "NVIDIA GPU", "mps": "Apple GPU", "cpu": "CPU", None: "not installed"}
 
 
 def mediapipe_version():

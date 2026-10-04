@@ -272,6 +272,25 @@ def real_video_file(tmp):
         assert trace_rows(files[0]) >= 30, trace_rows(files[0])
 
 
+def rtmpose_records(tmp):
+    """The 2D model end to end on the CPU: records seated, and never invents the hidden knees."""
+    if capture.rtm_device() is None:
+        print("      skipped: rtmlib and onnxruntime are not installed (README, Model menu)")
+        return
+    cpu = lambda: "cpu"  # noqa: E731
+    with app_on("upper", "knee_flexion", tmp, "rtmpose", RTM_TIERS=("s",),
+                extra=[(capture, "rtm_device", cpu), (rehapose, "rtm_device", cpu)]) as run:
+        run.window.act_models["rtmpose"].trigger()
+        files = press_start_and_finish(run)
+        assert len(files) == 1 and not RECORD.dialogs, (files, RECORD.dialogs)
+        head = storage.read_header(files[0])
+        assert (head["backend"], head["device"], head["model"]) == ("rtmpose", "cpu", "s"), head
+        assert trace_rows(files[0]) == len(CLIPS["upper"]) - HOLD + 1, trace_rows(files[0])
+        knees = storage.stored_summaries(files[0])
+        assert knees["left_knee"]["coverage"] == knees["right_knee"]["coverage"] == 0, knees
+        assert any("RTMPose-s 2D on CPU" in s for s in run.statuses), run.statuses[:3]
+
+
 def missing_clip(tmp):
     with app_on("no-such-clip", "knee_flexion", tmp, "missing") as run:
         assert press_start_and_finish(run) == []
@@ -281,7 +300,7 @@ def missing_clip(tmp):
 
 SCENARIOS = (upper_body_records, empty_room_saves_nothing, chair_stand_flow, quit_while_recording,
              offline_first_run, stop_mid_download, ratchet_steps_down, real_video_file,
-             missing_clip)
+             rtmpose_records, missing_clip)
 
 
 def main():

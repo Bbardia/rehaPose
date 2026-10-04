@@ -42,6 +42,36 @@ def visible(landmarks, joint, threshold=0.5):
     return all(landmarks[i].visibility >= threshold for i in JOINTS[joint])
 
 
+# COCO-17 keypoint k (RTMPose and other 2D models) -> its MediaPipe landmark index.
+COCO17_TO_MEDIAPIPE = (0, 2, 5, 7, 8, 11, 12, 13, 14, 15, 16, 23, 24, 25, 26, 27, 28)
+
+
+class Point:
+    """A landmark, as the angle and setup code reads MediaPipe's own."""
+
+    def __init__(self, x, y, z=0.0, visibility=0.0):
+        self.x, self.y, self.z, self.visibility = x, y, z, visibility
+
+
+class Planar(list):
+    """World landmarks from a 2D model: pixels with z = 0, so angles lie in the image plane."""
+
+    planar = True
+
+
+def from_coco17(keypoints, scores, frame_w, frame_h, margin=0.02):
+    """(pixel, world) in MediaPipe's layout; a point off or on the frame edge counts as hidden."""
+    pixel = [Point(0.5, 0.5) for _ in range(33)]
+    world = Planar(Point(0.0, 0.0) for _ in range(33))
+    for k, i in enumerate(COCO17_TO_MEDIAPIPE):
+        x, y = float(keypoints[k][0]), float(keypoints[k][1])
+        inside = (margin * frame_w <= x <= (1 - margin) * frame_w
+                  and margin * frame_h <= y <= (1 - margin) * frame_h)
+        pixel[i] = Point(x / frame_w, y / frame_h, 0.0, float(scores[k]) if inside else 0.0)
+        world[i] = Point(x, y, 0.0)  # pixels, never normalized: that would shear every angle
+    return pixel, world
+
+
 class OneEuro:
     """One Euro filter (Casiez et al. 2012): kills jitter at rest without smearing rep peaks."""
 
@@ -174,6 +204,8 @@ def _rep_roms(angles, spans):
 
 def orientation_cos(pixel, world, frame_w, frame_h):
     """~1.0 facing the camera, ~0.0 side-on; MUST use pixel coords, not normalized."""
+    if getattr(world, "planar", False):
+        return None  # a 2D model has no depth, so no turn to measure
     torso_px = abs((pixel[11].y + pixel[12].y) / 2 - (pixel[23].y + pixel[24].y) / 2) * frame_h
     torso_m = abs((world[11].y + world[12].y) / 2 - (world[23].y + world[24].y) / 2)
     if torso_px < 1e-6 or torso_m < 1e-9:
@@ -459,6 +491,20 @@ def _check_setup():
     assert hint == "Get your hips or knees fully in frame.", hint
 
 
+def _check_coco17():
+    kp, sc = np.zeros((17, 2)), np.full(17, 0.9)
+    kp[11], kp[13], kp[15] = (500, 300), (600, 400), (700, 300)  # left hip, knee, ankle
+    pixel, world = from_coco17(kp, sc, 1280, 720)
+    assert abs(flexion(world, "left_knee") - 90.0) < 1e-6, flexion(world, "left_knee")
+    assert visible(pixel, "left_knee") and pixel[25].x == 600 / 1280
+    assert orientation_cos(pixel, world, 1280, 720) is None
+    assert setup_check(pixel, world, 1280, 720, ("left_knee",), "side")[0], "2D has no turn advice"
+    assert pixel[31].visibility == 0, "COCO-17 has no foot index; it must never be drawn"
+    kp[13] = (600, 715)  # a knee on the bottom edge is a guess, not a measurement
+    pixel, _ = from_coco17(kp, sc, 1280, 720)
+    assert not visible(pixel, "left_knee")
+
+
 def demo():
     """Self-check: python analysis.py"""
     _check_angles()
@@ -472,6 +518,7 @@ def demo():
     _check_filter()
     _check_orientation()
     _check_setup()
+    _check_coco17()
     print("analysis.py self-check passed")
 
 

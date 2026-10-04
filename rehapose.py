@@ -17,7 +17,7 @@ from analysis import (CHAIR_STAND_HI, CHAIR_STAND_LO, CHAIR_STAND_SECONDS,
                       CONNECTIONS, EXERCISE_DISPLAY, EXERCISE_SETUP, EXERCISES, JOINTS,
                       OneEuro, chair_stand_norm, chair_stand_score, count_reps,
                       flexion, in_view, setup_check, summarize, visible)
-from capture import MODEL_DIR, PoseWorker, mediapipe_version
+from capture import DEVICE_NAMES, MODEL_DIR, PoseWorker, mediapipe_version, rtm_device
 from storage import (choose_data_dir, new_session_path, read_header, session_dir,
                      settings, stamp_of, stored_summaries, write_session)
 
@@ -31,7 +31,10 @@ TIPS = ("Keep the joints you are exercising in frame - the whole body is not nee
         "facing it for abduction. The status line says when the angle is off.\n\n"
         "Good light in front of you, not behind. Clothing that shows your\n"
         "knees and hips reads better than loose trousers.\n\n"
-        "Recording starts once the camera sees you; a chair stand waits for your knees.")
+        "Recording starts once the camera sees you; a chair stand waits for your knees.\n\n"
+        "With the RTMPose model (2D), angles are measured as the camera sees them, so\n"
+        "film the movement square on: side-on for bending, facing it for abduction.")
+BACKEND_NAMES = {"mediapipe": "MediaPipe 3D", "rtmpose": "RTMPose 2D"}
 
 
 LIVE_WINDOW_S = 20.0
@@ -118,6 +121,7 @@ def history_cells(path):
         head.get("duration_s", "-"),
         history_result(head),
         framing + "%" if framing else "-",
+        BACKEND_NAMES.get(head.get("backend"), "MediaPipe 3D"),  # older files predate the choice
     ]
 
 
@@ -239,6 +243,8 @@ class Main(QtWidgets.QMainWindow):
         self.pages.addWidget(self._build_history())
         self.setCentralWidget(self.pages)
 
+        self.rtm = rtm_device()  # None, "cpu", "mps" or "cuda": decides what the Model menu offers
+        self.backend = "mediapipe"
         self._build_menus()
         self.restore_settings()
         self.on_exercise_changed()
@@ -266,10 +272,28 @@ class Main(QtWidgets.QMainWindow):
         self.act_history = view_menu.addAction("History", self.show_history,
                                                QtGui.QKeySequence("Ctrl+2"))
 
+        model_menu = bar.addMenu("&Model")
+        group = QtWidgets.QActionGroup(self)
+        self.act_models = {}
+        for key, text in (("mediapipe", "MediaPipe - 3D, any computer"),
+                          ("rtmpose", "RTMPose - 2D, most accurate keypoints "
+                                      f"({DEVICE_NAMES[self.rtm]})")):
+            act = model_menu.addAction(text, lambda _checked=False, k=key: self.set_backend(k))
+            act.setCheckable(True)
+            group.addAction(act)
+            self.act_models[key] = act
+
         help_menu = bar.addMenu("&Help")
         help_menu.addAction("How to Record", self.show_tips,
                             QtGui.QKeySequence.HelpContents)
         help_menu.addAction("About rehaPose", self.show_about)
+
+    def set_backend(self, key):
+        self.backend = key
+        self.act_models[key].setChecked(True)
+        if key == "rtmpose":
+            self.status.setText(f"RTMPose on {DEVICE_NAMES[self.rtm]}: 2D angles, as the camera "
+                                "sees them - film side-on for bending, facing it for abduction.")
 
     def show_tips(self):
         QtWidgets.QMessageBox.information(self, "How to Record", TIPS)
@@ -305,6 +329,10 @@ class Main(QtWidgets.QMainWindow):
         self.person.setText(s.value("person", "", type=str))
         self.last_person = self.person.text().strip()
         self.cue.setChecked(s.value("beep", True, type=bool))
+        # An NVIDIA GPU gets the most accurate model by default; the Model menu changes it.
+        backend = s.value("backend", "rtmpose" if self.rtm == "cuda" else "mediapipe", type=str)
+        usable = backend == "mediapipe" or (backend == "rtmpose" and self.rtm is not None)
+        self.set_backend(backend if usable else "mediapipe")
 
     def save_settings(self):
         s = settings()
@@ -314,6 +342,7 @@ class Main(QtWidgets.QMainWindow):
         s.setValue("sex", self.sex.currentText())
         s.setValue("person", self.person.text().strip())
         s.setValue("beep", self.cue.isChecked())
+        s.setValue("backend", self.backend)
 
     def _sync(self):
         """The single place a widget is enabled or retitled; state is derived, not stored."""
@@ -326,6 +355,8 @@ class Main(QtWidgets.QMainWindow):
         self.export.setEnabled(reviewing)
         self.act_save.setEnabled(reviewing)
         self.act_history.setEnabled(not recording)
+        for key, act in self.act_models.items():
+            act.setEnabled(not recording and (key == "mediapipe" or self.rtm is not None))
         label = self.exercise.currentText()
         self.setWindowTitle(f"rehaPose - {label}" if recording else "rehaPose")
 
@@ -355,9 +386,9 @@ class Main(QtWidgets.QMainWindow):
     def _build_history(self):
         self.caption = QtWidgets.QLabel()
         self.caption.setWordWrap(True)
-        self.sessions = QtWidgets.QTableWidget(0, 6)
+        self.sessions = QtWidgets.QTableWidget(0, 7)
         self.sessions.setHorizontalHeaderLabels(
-            ["Date", "Person", "Exercise", "Length", "Result", "Framing"])
+            ["Date", "Person", "Exercise", "Length", "Result", "Framing", "Model"])
         self.sessions.horizontalHeader().setSectionResizeMode(
             QtWidgets.QHeaderView.Stretch)
         self.sessions.verticalHeader().setVisible(False)
@@ -392,8 +423,8 @@ class Main(QtWidgets.QMainWindow):
         if rows:
             self.caption.setText(
                 f"{len(rows)} session(s) in {target}. Double-click one to see its "
-                "numbers. Compare only sessions of the same exercise recorded from the "
-                "same camera position - treat differences under about 10° as noise.")
+                "numbers. Compare only sessions of the same exercise and model, recorded "
+                "from the same camera position - treat differences under about 10° as noise.")
         else:
             self.caption.setText(
                 "No sessions yet.\n\nRecord one from the Live screen and it will be "
@@ -472,7 +503,9 @@ class Main(QtWidgets.QMainWindow):
                          "person": self.person.text().strip(),
                          "age": None if age == AGE_UNSET else age,
                          "sex": None if self.sex.currentText() == SEX_UNSET
-                         else self.sex.currentText()}
+                         else self.sex.currentText(),
+                         "backend": self.backend,
+                         "device": self.rtm if self.backend == "rtmpose" else "cpu"}
 
     def confirm_discard(self):
         """True if it is fine to drop the session; asks only when the autosave failed."""
@@ -522,7 +555,7 @@ class Main(QtWidgets.QMainWindow):
         self.stack.setCurrentIndex(0)
         self.pages.setCurrentIndex(0)
         self.t0 = time.perf_counter()
-        self.worker = PoseWorker(self.camera)
+        self.worker = PoseWorker(self.camera, self.recorded["backend"])
         self.worker.ready.connect(self.on_frame)
         self.worker.status.connect(self.on_status)
         self.worker.failed.connect(self.on_failed)
@@ -807,6 +840,7 @@ class Main(QtWidgets.QMainWindow):
             ["duration_s", f"{duration:.0f}"],
             # Provenance: which model produced which angles.
             ["app_version", VERSION, "model", self.model_tier],
+            ["backend", rec["backend"], "device", rec["device"]],
             ["mediapipe", mediapipe_version()],
             ["best_rom", f"{best:.0f}°", "best_joint", best_joint],
         ]

@@ -384,6 +384,7 @@ def check_shell(window, tmp, frame, poses):
     check_no_junk_session(window)
     check_rep_cue(window)
     check_clip_end(window)
+    check_model_menu(window)
     saved, head = check_exercise_keys(window)
     stored = check_round_trip(window, saved)
     check_half_write(window, saved)
@@ -528,6 +529,41 @@ def check_rep_cue(window):
         RECORD.tones.clear()
         window.tick_chair_stand(0.0, "")
         assert RECORD.tones == beeps, (ticked, RECORD.tones)
+
+
+def check_model_menu(window):
+    found = window.rtm
+    window.rtm = None
+    window._sync()
+    assert not window.act_models["rtmpose"].isEnabled(), "RTMPose offered without rtmlib"
+    window.rtm, window.worker = "cpu", FakeWorker()
+    window._sync()
+    assert not any(a.isEnabled() for a in window.act_models.values()), "switchable mid-session"
+    window.worker = None
+    window._sync()
+    window.act_models["rtmpose"].trigger()  # the real menu action, as a click sends it
+    assert window.backend == "rtmpose" and "2D" in window.status.text(), window.status.text()
+    window._snapshot()
+    window.summaries = {j: analysis.summarize(window.angles[j]) for j in JOINTS}
+    saved = window.autosave()
+    head = storage.read_header(saved)
+    assert (head["backend"], head["device"]) == ("rtmpose", "cpu"), head
+    window.show_history()
+    assert window.sessions.item(0, 6).text() == "RTMPose 2D", window.sessions.item(0, 6).text()
+    saved.unlink()
+    window.save_settings()
+    window.rtm = None
+    window.restore_settings()
+    assert window.backend == "mediapipe", "a saved RTMPose choice survived its uninstall"
+    rehapose.settings().remove("backend")
+    for rtm, default in (("cuda", "rtmpose"), ("mps", "mediapipe"), ("cpu", "mediapipe")):
+        window.rtm = rtm
+        window.restore_settings()
+        assert window.backend == default, (rtm, window.backend)
+    window.rtm = found
+    window.set_backend("mediapipe")
+    window._snapshot()
+    window._sync()
 
 
 def check_clip_end(window):
