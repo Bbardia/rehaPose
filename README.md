@@ -45,7 +45,7 @@ by itself and the numbers appear on the right.
 
 - **30-second chair stand** — a scored test. Sit on a 43–45 cm chair against a wall,
   arms crossed at the chest, and stand fully and sit as many times as you can in 30
-  seconds. Once the framing is good the app counts down **3-2-1 with a tone on each
+  seconds. Once a knee is in view the app counts down **3-2-1 with a tone on each
   number**, sounds a high tone for go and a low one when time is up, and shows the count
   large on the video. As the published protocol does, a final stand **more than halfway
   up** when time is called counts. It prints the published reference for the age and
@@ -62,12 +62,18 @@ last person's — otherwise the previous patient's reference would print beside 
 patient's count. Until both are entered, a chair stand prints its count with no
 reference.
 
-In every mode the app will not start measuring until the setup is good. It tells you
-what is wrong — side-on, whole body in frame, not clipping the edge — and starts the
-clock once you have *held* that position for about a third of a second, not when you
-press the button. One lucky frame does not count: the side-on reading is noisy enough
-that a single frame can pass on a camera position that is not good. That matters:
-camera placement is the largest error source you actually control.
+**You do not need your whole body in frame** — only the joints the exercise uses: knees
+for knee flexion, heel slides and the chair stand, shoulders for the shoulder exercises
+(the shoulder angle is measured against your trunk, so keep that side's hip in view too).
+Recording starts as soon as the camera has seen you for about a third of a second, and
+the skeleton is drawn from the first frame, only where the model is confident.
+
+Framing is **advice, not a gate**: the status line says when the exercise's joints are
+out of frame or the camera angle is wrong for the movement — side-on for bending (knee,
+hip and shoulder flexion, chair stand), facing the camera for abduction — and the results
+report how much of the session was well framed. Only the scored chair stand waits, for a
+knee to be in view, before its countdown. Camera placement is still the largest error
+source you control, so take the advice when you can.
 
 Graphs show a rolling 20 seconds; the full session is kept and analysed on Stop. A gap
 in a line means that joint was not confidently tracked in those frames.
@@ -97,7 +103,7 @@ Every session is **saved automatically** on Stop — summary plus the full per-f
 into the folder you chose on first run. **File → Save a Copy…** (`Cmd+S`) puts one
 somewhere else as well, and **File → Show Sessions Folder** opens the folder.
 
-If the framing never came good, nothing is written: an all-zeros row is not a session.
+If the camera never saw you, nothing is written: an all-zeros row is not a session.
 If the camera fails mid-session, what was recorded up to that point is kept and saved.
 If the save itself fails (full disk, unplugged drive) the status line says **NOT SAVED**
 and the results stay on screen. Until a copy exists the app will not let that session

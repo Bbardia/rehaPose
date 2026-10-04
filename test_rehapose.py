@@ -75,6 +75,7 @@ def run(app, tmp):
     assert detected > 0, "MediaPipe found no pose in the sample photo"
 
     check_orientation(frame, poses)
+    check_overlay()
     check_setup_gate(window, app, frame, poses)
     check_autosave(window)
     check_chair_verdict(window)
@@ -139,21 +140,33 @@ def check_orientation(frame, poses):
     assert abs(turns[0] - turns[1]) < 0.15, turns
 
 
-def check_setup_gate(window, app, frame, poses):
-    rehapose.setup_check = lambda *_a, **_k: (False, "Turn side-on to the camera.")
-    window.on_frame(frame.copy(), poses[0], 7.0)
-    assert window.clock_start is None, "gate let a badly framed session start"
-    assert all(not window.angles[j] for j in JOINTS), "gated frames were still recorded"
-    assert window.video.pixmap() is not None, "gate should still show the camera"
+def check_overlay():
+    pixel, _ = analysis._body(0)
+    for i in (25, 26, 27, 28):
+        pixel[i] = analysis._P(pixel[i].x, pixel[i].y, 0, v=0.1)
+    drawn = rehapose.draw_overlay(np.zeros((720, 1280, 3), np.uint8), pixel, {})
+    assert drawn[int(pixel[11].y * 720), int(pixel[11].x * 1280)].any(), "shoulder not drawn"
+    ankle = int(pixel[27].y * 720), int(pixel[27].x * 1280)
+    assert not drawn[ankle[0] - 3:ankle[0] + 4, ankle[1] - 3:ankle[1] + 4].any(), "phantom leg"
 
-    good = lambda *_a, **_k: (True, "Setup looks good.")  # noqa: E731
-    bad = lambda *_a, **_k: (False, "Turn side-on to the camera.")  # noqa: E731
-    # The hold is CONSECUTIVE: a bad frame in the middle resets the count.
-    for check in [good] * (rehapose.SETUP_HOLD - 1) + [bad] + [good] * (rehapose.SETUP_HOLD - 1):
-        rehapose.setup_check = check
-        window.on_frame(frame.copy(), poses[0], 7.0)
-    assert window.clock_start is None, "one good frame short of the hold, and it started"
-    rehapose.setup_check = good
+
+def check_setup_gate(window, app, frame, poses):
+    window.on_frame(frame.copy(), (None, None), 7.0)
+    assert window.clock_start is None, "the clock started with nobody in view"
+    assert all(not window.angles[j] for j in JOINTS), "frames without a person were recorded"
+    assert window.video.pixmap() is not None, "gate should still show the camera"
+    assert "No person" in window.status.text(), window.status.text()
+
+    # Bad framing is advice only, but the start needs SETUP_HOLD CONSECUTIVE frames in view.
+    rehapose.setup_check = lambda *_a, **_k: (False, "Turn side-on to the camera.")
+    hold = rehapose.SETUP_HOLD - 1
+    drawn = []
+    real_draw, rehapose.draw_overlay = rehapose.draw_overlay, lambda f, *_a: drawn.append(1) or f
+    for pair in [poses[0]] * hold + [(None, None)] + [poses[0]] * hold:
+        window.on_frame(frame.copy(), pair, 7.0)
+    rehapose.draw_overlay = real_draw
+    assert window.clock_start is None, "one frame short of the hold, and it started"
+    assert len(drawn) == 2 * hold, "no skeleton while waiting for the clock"
     for i, landmark_pair in enumerate(poses):
         window.t0 = -(i / 30.0)  # advance the clock without sleeping
         window.on_frame(frame.copy(), landmark_pair, 7.0)
@@ -162,6 +175,9 @@ def check_setup_gate(window, app, frame, poses):
     for joint in JOINTS:
         assert len(window.angles[joint]) == 30, (joint, len(window.angles[joint]))
     assert len(window.stands) == 30
+    assert "Turn side-on" in window.status.text(), "framing advice not shown while recording"
+    assert (window.frames, window.setup_ok) == (30, 0), "badly framed frames counted as good"
+    rehapose.setup_check = lambda *_a, **_k: (True, "Setup looks good.")
 
 
 def check_autosave(window):
@@ -220,7 +236,12 @@ def check_countdown(window, frame, poses):
     window.angles = {j: [] for j in JOINTS}
     window.stands, window.stand_count, window.clock_start = [], 0, None
     window.counted, window.time_called, window.final_counted = None, False, False
-    window.frames = window.setup_ok = 0
+    window.frames = window.setup_ok = window.good_run = 0
+    real_in_view, rehapose.in_view = rehapose.in_view, lambda *_a, **_k: []
+    for _ in range(rehapose.SETUP_HOLD + 2):
+        window.on_frame(frame.copy(), poses[0], 7.0)
+    rehapose.in_view = real_in_view
+    assert window.clock_start is None, "the chair stand started without a knee in view"
     window.good_run = rehapose.SETUP_HOLD - 1
     window.on_frame(frame.copy(), poses[0], 7.0)
     assert window.clock_start > time.perf_counter(), "no countdown before a scored test"

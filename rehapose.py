@@ -14,9 +14,9 @@ import pyqtgraph as pg
 from PyQt5 import QtCore, QtGui, QtMultimedia, QtWidgets, sip
 
 from analysis import (CHAIR_STAND_HI, CHAIR_STAND_LO, CHAIR_STAND_SECONDS,
-                      CONNECTIONS, EXERCISE_DISPLAY, EXERCISES, JOINTS, OneEuro,
-                      chair_stand_norm, chair_stand_score, count_reps,
-                      flexion, setup_check, summarize, visible)
+                      CONNECTIONS, EXERCISE_DISPLAY, EXERCISE_SETUP, EXERCISES, JOINTS,
+                      OneEuro, chair_stand_norm, chair_stand_score, count_reps,
+                      flexion, in_view, setup_check, summarize, visible)
 from capture import MODEL_DIR, PoseWorker, mediapipe_version
 from storage import (choose_data_dir, new_session_path, read_header, session_dir,
                      settings, stamp_of, stored_summaries, write_session)
@@ -25,11 +25,13 @@ VERSION = "0.2"
 MIN_COVERAGE = 80.0  # below this a row is not reported
 AGE_UNSET = 17  # spinbox "not entered" value
 SEX_UNSET = "sex ?"
-SETUP_HOLD = 10  # good frames before the clock, so one noisy frame cannot start it
-TIPS = ("Stand side-on to the camera, with your whole body in frame.\n\n"
+SETUP_HOLD = 10  # frames in view before the clock, so one stray detection cannot start it
+TIPS = ("Keep the joints you are exercising in frame - the whole body is not needed.\n\n"
+        "Side-on to the camera for bending (knee, hip and shoulder flexion, chair stand),\n"
+        "facing it for abduction. The status line says when the angle is off.\n\n"
         "Good light in front of you, not behind. Clothing that shows your\n"
         "knees and hips reads better than loose trousers.\n\n"
-        "Recording starts once the framing is right, not when you press Start.")
+        "Recording starts once the camera sees you; a chair stand waits for your knees.")
 
 
 LIVE_WINDOW_S = 20.0
@@ -68,10 +70,13 @@ def big_text(frame, text):
 def draw_overlay(frame, pixel, angles):
     h, w = frame.shape[:2]
     pts = [(int(p.x * w), int(p.y * h)) for p in pixel]
+    seen = [p.visibility >= 0.5 for p in pixel]  # hidden landmarks are guesses: no phantom limbs
     for a, b in CONNECTIONS:
-        cv2.line(frame, pts[a], pts[b], (245, 180, 60), 2, cv2.LINE_AA)
-    for x, y in pts:
-        cv2.circle(frame, (x, y), 4, (60, 220, 255), -1, cv2.LINE_AA)
+        if seen[a] and seen[b]:
+            cv2.line(frame, pts[a], pts[b], (245, 180, 60), 2, cv2.LINE_AA)
+    for (x, y), ok in zip(pts, seen, strict=True):
+        if ok:
+            cv2.circle(frame, (x, y), 4, (60, 220, 255), -1, cv2.LINE_AA)
     for joint, value in angles.items():
         if value is None:
             continue
@@ -543,7 +548,7 @@ class Main(QtWidgets.QMainWindow):
             self.status.setText(
                 "Stopped before the test started - nothing recorded."
                 if self.clock_start is not None else
-                "Nothing recorded - the framing never came good. See Help > How to Record.")
+                "Nothing recorded - the camera never saw you. See Help > How to Record.")
             self._sync()
             return
         self.show_results()
@@ -568,10 +573,13 @@ class Main(QtWidgets.QMainWindow):
         QtWidgets.QMessageBox.critical(self, "rehaPose", message)
 
     def gate(self, pixel, world, frame):
-        """(ok, hint). Starts the clock once setup has held for SETUP_HOLD frames, not at Start."""
+        """(ok, hint). Starts the clock once you are in view (chair stand: a knee), not at Start."""
         h, w = frame.shape[:2]
-        ok, hint = setup_check(pixel, world, w, h)
-        self.good_run = self.good_run + 1 if ok else 0
+        joints, view = EXERCISE_SETUP[self.recorded["exercise"]]
+        ok, hint = setup_check(pixel, world, w, h, joints, view)
+        # Framing is advice; only the scored chair stand waits for the joints it counts.
+        ready = pixel is not None and (not self.recorded["chair"] or bool(in_view(pixel, joints)))
+        self.good_run = self.good_run + 1 if ready else 0
         if self.clock_start is None and self.good_run >= SETUP_HOLD:
             lead = COUNTDOWN_S if self.recorded["chair"] else 0
             self.clock_start = time.perf_counter() + lead
@@ -608,7 +616,7 @@ class Main(QtWidgets.QMainWindow):
         pixel, world = landmarks
         ok, hint = self.gate(pixel, world, frame)
         if not self._clock_running():
-            self.show_waiting(cv2.flip(frame, 1), hint)
+            self.show_waiting(frame, pixel, hint)
             return
         if self.counted:  # first measured frame after a countdown
             self.counted = 0
@@ -635,8 +643,11 @@ class Main(QtWidgets.QMainWindow):
             big_text(shown, str(self.stand_count))
         self.show_frame(shown)
 
-    def show_waiting(self, shown, hint):
-        """Before the clock: setup hints, then a 3-2-1 with a tone per number."""
+    def show_waiting(self, frame, pixel, hint):
+        """Before the clock: skeleton and setup hint, then a 3-2-1 with a tone per number."""
+        if pixel is not None:
+            frame = draw_overlay(frame, pixel, {})
+        shown = cv2.flip(frame, 1)
         if self.clock_start is None:
             self.status.setText(f"Setup: {hint}")
         else:

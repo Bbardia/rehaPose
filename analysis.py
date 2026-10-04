@@ -190,32 +190,36 @@ def orientation_cos(pixel, world, frame_w, frame_h):
     return min(1.0, sum(ratios) / len(ratios)) if ratios else None
 
 
-def setup_check(pixel, world, frame_w, frame_h, view="side", margin=0.02):
-    """(ok, message) on camera placement; a warning, not a lock."""
+def in_view(pixel, joints, margin=0.02):
+    """The joints whose three landmarks are confidently visible and clear of the frame edge."""
+    return [j for j in joints if visible(pixel, j) and all(
+        margin <= pixel[i].x <= 1 - margin and margin <= pixel[i].y <= 1 - margin
+        for i in JOINTS[j])]
+
+
+def setup_check(pixel, world, frame_w, frame_h, joints=tuple(JOINTS), view=None, margin=0.02):
+    """(ok, hint) for the exercise's joints and camera angle; advice, never a lock."""
     if pixel is None or world is None:
         return False, "No person detected - step into frame."
-    problem = _framing_problem(pixel, margin)
-    if problem:
-        return False, problem
+    if not in_view(pixel, joints, margin):
+        parts = sorted({j.split("_", 1)[1] + "s" for j in joints})
+        names = parts[0] if len(parts) == 1 else ", ".join(parts[:-1]) + " or " + parts[-1]
+        return False, f"Get your {names} fully in frame."
+    hint = _angle_hint(pixel, world, frame_w, frame_h, view)
+    return (False, hint) if hint else (True, "Setup looks good.")
+
+
+def _angle_hint(pixel, world, frame_w, frame_h, view):
+    """Advice if the camera sees the movement from the wrong side, else None (also if unsure)."""
+    if not view or any(pixel[i].visibility < 0.5 for i in (11, 12, 23, 24)):
+        return None
     cos = orientation_cos(pixel, world, frame_w, frame_h)
     if cos is None:
-        return False, "Cannot read your orientation - step back into full view."
+        return None
     if view == "side" and cos > 0.5:
-        return False, f"Turn side-on to the camera (currently {round(cos * 100)}% front-on)."
+        return f"Turn side-on to the camera (currently {round(cos * 100)}% front-on)."
     if view == "front" and cos < 0.8:
-        return False, f"Turn to face the camera (currently {round(cos * 100)}% front-on)."
-    return True, "Setup looks good."
-
-
-def _framing_problem(pixel, margin):
-    """Message if the head-to-feet landmarks are hidden or touch the frame edge, else None."""
-    needed = [0, 11, 12, 23, 24, 25, 26, 27, 28]
-    if any(pixel[i].visibility < 0.5 for i in needed):
-        return "Whole body not visible - step back so head and feet are in frame."
-    xs = [pixel[i].x for i in needed]
-    ys = [pixel[i].y for i in needed]
-    if min(xs) < margin or max(xs) > 1 - margin or min(ys) < margin or max(ys) > 1 - margin:
-        return "Body is touching the edge of frame - step back or re-aim."
+        return f"Turn to face the camera (currently {round(cos * 100)}% front-on)."
     return None
 
 
@@ -230,6 +234,16 @@ EXERCISES = (
     ("other",              "Other / unlabelled", False),
 )
 EXERCISE_DISPLAY = {key: display for key, display, _ in EXERCISES}
+# Joints each exercise needs in view, and the camera angle that sees its plane of movement.
+EXERCISE_SETUP = {
+    "chair_stand_30s":    (("left_knee", "right_knee"), "side"),
+    "knee_flexion":       (("left_knee", "right_knee"), "side"),
+    "hip_abduction":      (("left_hip", "right_hip"), "front"),
+    "shoulder_abduction": (("left_shoulder", "right_shoulder"), "front"),
+    "shoulder_flexion":   (("left_shoulder", "right_shoulder"), "side"),
+    "heel_slides":        (("left_knee", "right_knee", "left_hip", "right_hip"), "side"),
+    "other":              (tuple(JOINTS), None),
+}
 
 
 # --- 30-Second Chair Stand -------------------------------------------------------
@@ -364,6 +378,7 @@ def _check_exercises_and_norms():
         "chair_stand_30s", "knee_flexion", "hip_abduction", "shoulder_abduction",
         "shoulder_flexion", "heel_slides", "other"]
     assert len({k for k, _, _ in EXERCISES}) == len(EXERCISES), "duplicate exercise key"
+    assert set(EXERCISE_SETUP) == {k for k, _, _ in EXERCISES}, "exercise without a setup"
 
     assert chair_stand_norm(72, "female") == 14
     assert chair_stand_norm(72, "male") == 15
@@ -417,16 +432,31 @@ def _check_orientation():
 
 
 def _check_setup():
+    knee, abduction = EXERCISE_SETUP["knee_flexion"], EXERCISE_SETUP["shoulder_abduction"]
+    knees, shoulders = knee[0], abduction[0]
     assert setup_check(None, None, 1280, 720)[0] is False
-    assert setup_check(*_body(80), 1280, 720) == (True, "Setup looks good.")
-    ok, hint = setup_check(*_body(0), 1280, 720)
+    # Bending is filmed side-on, abduction facing the camera.
+    assert setup_check(*_body(80), 1280, 720, *knee) == (True, "Setup looks good.")
+    ok, hint = setup_check(*_body(0), 1280, 720, *knee)
     assert not ok and "side-on" in hint, hint
-    assert setup_check(*_body(0), 1280, 720, view="front")[0]
-    pixel, world = _body(80)
-    pixel[27] = _P(pixel[27].x, pixel[27].y, 0, v=0.1)
-    assert "Whole body" in setup_check(pixel, world, 1280, 720)[1]
+    assert setup_check(*_body(0), 1280, 720, *abduction)[0]
+    ok, hint = setup_check(*_body(80), 1280, 720, *abduction)
+    assert not ok and "face the camera" in hint, hint
+    # Legs out of frame: fine for a shoulder exercise, not for a knee one.
+    pixel, world = _body(0)
+    for i in (25, 26, 27, 28):
+        pixel[i] = _P(pixel[i].x, pixel[i].y, 0, v=0.1)
+    assert setup_check(pixel, world, 1280, 720, shoulders, "front")[0]
+    ok, hint = setup_check(pixel, world, 1280, 720, knees, "side")
+    assert not ok and hint == "Get your knees fully in frame.", hint
+    assert setup_check(pixel, world, 1280, 720)[0], "'other' needs any joint, not all"
     pixel, world = _body(80, px_per_m=420.0)               # feet run off the bottom
-    assert "edge" in setup_check(pixel, world, 1280, 720)[1]
+    assert in_view(pixel, shoulders) and not in_view(pixel, knees)
+    pixel, world = _body(0)
+    for i in (23, 24, 25, 26, 27, 28):
+        pixel[i] = _P(pixel[i].x, pixel[i].y, 0, v=0.1)
+    hint = setup_check(pixel, world, 1280, 720, EXERCISE_SETUP["heel_slides"][0], "side")[1]
+    assert hint == "Get your hips or knees fully in frame.", hint
 
 
 def demo():
