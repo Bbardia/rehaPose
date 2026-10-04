@@ -236,6 +236,7 @@ why there is a setup gate and why the numbers above are what they are.
 ## Checks
 
 ```bash
+.venv/bin/pip install ruff==0.16.8   # once: the linter version CI pins
 git config core.hooksPath githooks   # once per clone: the checks below run on commit and push
 
 githooks/pre-commit                  # ~10 s, every commit: lint, maths self-check, UI smoke test
@@ -251,6 +252,9 @@ radon cc -s -a *.py                  # complexity
   the paths a regression would most likely break: recording while seated, an empty room,
   the full chair-stand flow, quitting mid-session, a first run offline, Stop during the
   model download, the heavy-to-lite switch, a real video file and a missing one.
+- On commit and push the hooks test **exactly what is committed or pushed**, from a clean
+  snapshot - a file you forgot to `git add` fails the commit, and unrelated work in progress
+  does not. Run by hand, they test your working tree.
 - Both keep everything in a temporary folder and never touch your real settings or camera.
   On failure, `REHAPOSE_ARTIFACTS=dir` saves a screenshot of the window and the sessions.
 - CI runs all of it on macOS arm64 and Ubuntu x64 and uploads those artifacts on failure.
