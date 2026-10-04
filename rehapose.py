@@ -67,7 +67,8 @@ def big_text(frame, text):
     return frame
 
 
-def draw_overlay(frame, pixel, angles):
+def draw_overlay(frame, pixel):
+    """Skeleton on the UNFLIPPED frame, so it lines up after the mirror flip."""
     h, w = frame.shape[:2]
     pts = [(int(p.x * w), int(p.y * h)) for p in pixel]
     seen = [p.visibility >= 0.5 for p in pixel]  # hidden landmarks are guesses: no phantom limbs
@@ -77,13 +78,18 @@ def draw_overlay(frame, pixel, angles):
     for (x, y), ok in zip(pts, seen, strict=True):
         if ok:
             cv2.circle(frame, (x, y), 4, (60, 220, 255), -1, cv2.LINE_AA)
-    for joint, value in angles.items():
-        if value is None:
-            continue
-        x, y = pts[JOINTS[joint][1]]
-        cv2.putText(frame, f"{value:.0f}", (x + 8, y - 8),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
     return frame
+
+
+def draw_labels(shown, pixel, angles):
+    """Angle numbers on the MIRRORED frame at the mirrored spot, so the digits read correctly."""
+    h, w = shown.shape[:2]
+    for joint, value in angles.items():
+        if value is not None:
+            p = pixel[JOINTS[joint][1]]
+            cv2.putText(shown, f"{value:.0f}", (w - 1 - int(p.x * w) + 8, int(p.y * h) - 8),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
+    return shown
 
 
 def history_result(head):
@@ -144,7 +150,7 @@ class Main(QtWidgets.QMainWindow):
         self.viewing_stored = None
         self.model_tier = ""
         self.unsaved = False  # autosave failed and no copy exists
-        self.retiring = None  # a stopped worker that outlived its 2 s wait
+        self.retiring = None  # the last let-go worker, kept so _stale() can still name it
         MODEL_DIR.mkdir(parents=True, exist_ok=True)
         self.sounds = {}
         for name, (freq, ms) in TONES.items():
@@ -518,6 +524,7 @@ class Main(QtWidgets.QMainWindow):
         self.worker.ready.connect(self.on_frame)
         self.worker.status.connect(self.on_status)
         self.worker.failed.connect(self.on_failed)
+        self.worker.finished.connect(self.on_ended)
         self.worker.start()
         self._sync()
 
@@ -534,7 +541,8 @@ class Main(QtWidgets.QMainWindow):
                 # Destroying a running QThread is a qFatal abort: hand it to C++ with no parent.
                 sip.transferto(worker, None)
                 worker.finished.connect(worker.deleteLater)
-                self.retiring = worker
+            # A freed sender reads as None and slips past _stale(), so keep the last one.
+            self.retiring = worker
             # Record a heavy->lite step-down: the tiers disagree by up to ~50 deg on one joint.
             self.model_tier = "->".join(worker.tier_log)
 
@@ -545,14 +553,22 @@ class Main(QtWidgets.QMainWindow):
         if not self.measured:
             # Nothing was measured: an all-zeros row is not a session.
             self.video.setText(TIPS)
-            self.status.setText(
-                "Stopped before the test started - nothing recorded."
-                if self.clock_start is not None else
-                "Nothing recorded - the camera never saw you. See Help > How to Record.")
+            self.status.setText(self._nothing_recorded())
             self._sync()
             return
         self.show_results()
         self._sync()
+
+    def _nothing_recorded(self):
+        if self.clock_start is not None:
+            return "Stopped before the test started - nothing recorded."
+        who = "your knees were" if self.recorded["chair"] else "you were"
+        return f"Nothing recorded - {who} never in view. See Help > How to Record."
+
+    def on_ended(self):
+        """The source ran out (a clip): the normal Stop. A let-go worker's finished is stale."""
+        if not self._stale():
+            self.stop()
 
     def on_status(self, message):
         if self._stale():
@@ -636,9 +652,11 @@ class Main(QtWidgets.QMainWindow):
 
     def show_live(self, frame, pixel, current):
         if pixel is not None:
-            frame = draw_overlay(frame, pixel, current)
+            frame = draw_overlay(frame, pixel)
         # Mirror at display time only, so overlay and left/right labels stay correct.
         shown = cv2.flip(frame, 1)
+        if pixel is not None:
+            draw_labels(shown, pixel, current)
         if self.recorded["chair"]:
             big_text(shown, str(self.stand_count))
         self.show_frame(shown)
@@ -646,7 +664,7 @@ class Main(QtWidgets.QMainWindow):
     def show_waiting(self, frame, pixel, hint):
         """Before the clock: skeleton and setup hint, then a 3-2-1 with a tone per number."""
         if pixel is not None:
-            frame = draw_overlay(frame, pixel, {})
+            frame = draw_overlay(frame, pixel)
         shown = cv2.flip(frame, 1)
         if self.clock_start is None:
             self.status.setText(f"Setup: {hint}")

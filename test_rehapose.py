@@ -144,10 +144,25 @@ def check_overlay():
     pixel, _ = analysis._body(0)
     for i in (25, 26, 27, 28):
         pixel[i] = analysis._P(pixel[i].x, pixel[i].y, 0, v=0.1)
-    drawn = rehapose.draw_overlay(np.zeros((720, 1280, 3), np.uint8), pixel, {})
+    drawn = rehapose.draw_overlay(np.zeros((720, 1280, 3), np.uint8), pixel)
     assert drawn[int(pixel[11].y * 720), int(pixel[11].x * 1280)].any(), "shoulder not drawn"
     ankle = int(pixel[27].y * 720), int(pixel[27].x * 1280)
     assert not drawn[ankle[0] - 3:ankle[0] + 4, ankle[1] - 3:ankle[1] + 4].any(), "phantom leg"
+
+
+def check_labels(window):
+    pixel = [analysis._P(0.5, 0.5, 0, v=0.0) for _ in range(33)]
+    pixel[25] = analysis._P(0.25, 0.5, 0)
+    shown, chair = [], window.recorded["chair"]
+    window.recorded["chair"] = False
+    window.show_frame = shown.append
+    window.show_live(np.zeros((720, 1280, 3), np.uint8), pixel, {"left_knee": 42.0})
+    del window.show_frame
+    expected = cv2.flip(rehapose.draw_overlay(np.zeros((720, 1280, 3), np.uint8), pixel), 1)
+    cv2.putText(expected, "42", (1279 - 320 + 8, 360 - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                (255, 255, 255), 2, cv2.LINE_AA)
+    assert np.array_equal(shown[0], expected), "angle label mirrored or misplaced on the video"
+    window.recorded["chair"] = chair
 
 
 def check_setup_gate(window, app, frame, poses):
@@ -212,11 +227,11 @@ def check_chair_verdict(window):
     window.stand_count = 7
     window.time_called = True
     line = window.verdict()
-    assert "Chair stands: 7" in line and "14" in line, line
+    assert "Chair stands: 7" in line and "female aged 72: 14." in line, line
     assert "cannot check" in line, "protocol caveat missing from the result"
     window.time_called = False
     line = window.verdict()
-    assert "not a 30-second score" in line and "14" not in line, line
+    assert "not a 30-second score" in line and "Reference for" not in line, line
     for extra in rehapose.session_dir().glob("*.csv"):
         extra.unlink()
 
@@ -306,12 +321,14 @@ real_session_dir = storage.session_dir
 def check_shell(window, tmp, frame, poses):
     """The app shell: state machine, menus, history round-trip, junk-session guard."""
     check_sync(window)
+    check_labels(window)
     check_stale_frame(window, frame, poses)
     blocker = check_failed_save(window, tmp)
     check_unsaved_guard(window, tmp, blocker)
     check_still_stopping(window)
     check_save_retry(window, tmp)
     check_no_junk_session(window)
+    check_clip_end(window)
     saved, head = check_exercise_keys(window)
     stored = check_round_trip(window, saved)
     check_half_write(window, saved)
@@ -341,13 +358,28 @@ def check_sync(window):
 
 
 def check_stale_frame(window, frame, poses):
-    class OldWorker(QtCore.QObject):
+    class Queued(QtCore.QThread):
         ready = QtCore.pyqtSignal(object, object, float)
-    old = OldWorker()
-    old.ready.connect(window.on_frame)
+        tier_log = ["lite"]
+
+        def stop(self):
+            pass
+
+        def run(self):
+            for _ in range(3):
+                self.ready.emit(frame.copy(), poses[0], 7.0)
+
+    worker = Queued()
+    worker.ready.connect(window.on_frame)
+    window.worker = worker
+    worker.start()
+    worker.wait()  # three frames queued and the thread done, as at a real Stop
     count = len(window.angles["left_knee"])
-    old.ready.emit(frame.copy(), poses[0], 7.0)
+    window._detach()
+    del worker  # only the window may keep it alive, as in the app
+    QtWidgets.QApplication.processEvents()
     assert len(window.angles["left_knee"]) == count, "stale frame was recorded"
+    window.retiring = None
 
 
 def check_failed_save(window, tmp):
@@ -413,12 +445,26 @@ def check_save_retry(window, tmp):
 def check_no_junk_session(window):
     recorded, window.times = window.times, {j: [] for j in JOINTS}
     window.summaries = {}
+    before = set(rehapose.session_dir().glob("*.csv"))
+    for chair, said in ((False, "you were never in view"), (True, "your knees were never")):
+        window.worker, window.clock_start = FakeWorker(), None
+        window.recorded["chair"] = chair
+        window.stop()
+        assert window.worker is None
+        assert said in window.status.text(), window.status.text()
+    assert set(rehapose.session_dir().glob("*.csv")) == before, "junk session written"
+    window.recorded["chair"] = False
+    window.times = recorded
+
+
+def check_clip_end(window):
     window.worker = FakeWorker()
     before = set(rehapose.session_dir().glob("*.csv"))
-    window.stop()
-    assert window.worker is None
-    assert set(rehapose.session_dir().glob("*.csv")) == before, "junk session written"
-    window.times = recorded
+    window.on_ended()  # a clip ran out: the same as pressing Stop
+    assert window.worker is None, "the end of a clip did not stop the session"
+    added = set(rehapose.session_dir().glob("*.csv")) - before
+    assert len(added) == 1, "the end of a clip did not save the session"
+    added.pop().unlink()
 
 
 def check_exercise_keys(window):

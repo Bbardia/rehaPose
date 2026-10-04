@@ -79,7 +79,8 @@ class PoseWorker(QtCore.QThread):
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         if not cap.isOpened():
-            self.failed.emit(f"Could not open camera {self.camera}. Try --camera 1.")
+            self.failed.emit(f"Could not open {self.camera}." if isinstance(self.camera, str)
+                             else f"Could not open camera {self.camera}. Try --camera 1.")
             return None
         return cap
 
@@ -112,6 +113,8 @@ class PoseWorker(QtCore.QThread):
         try:
             while not self._stop:
                 ok, frame = cap.read()
+                if not ok and isinstance(self.camera, str):
+                    return  # end of a clip: finished -> Main.on_ended -> the normal Stop
                 if not ok:
                     # Denied macOS camera permission opens the device but never yields frames.
                     misses += 1
