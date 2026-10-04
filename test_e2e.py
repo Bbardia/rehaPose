@@ -3,6 +3,7 @@ import contextlib
 import os
 import pathlib
 import resource
+import shutil
 import sys
 import time
 import types
@@ -83,8 +84,8 @@ def trace_rows(path):
 @contextlib.contextmanager
 def app_on(clip, exercise, tmp, name, gui_delay=0.0, **patches):
     """A fresh window on `clip`: lite pinned, video-time clock, sessions in their own folder."""
-    clock, counts = [0.0], {"live": 0, "stale": 0, "inferred": 0}
-    real_on_frame, real_infer = rehapose.Main.on_frame, capture.PoseWorker._infer
+    clock, counts = [0.0], {"live": 0, "stale": 0}
+    real_on_frame = rehapose.Main.on_frame
 
     def on_frame(self, *args):  # the clock moves one frame per delivered frame: exact results
         clock[0] += 1 / FPS
@@ -92,10 +93,6 @@ def app_on(clip, exercise, tmp, name, gui_delay=0.0, **patches):
         if gui_delay:
             time.sleep(gui_delay)  # a slow GUI, so frames queue up behind it
         return real_on_frame(self, *args)
-
-    def infer(self, *args):
-        counts["inferred"] += 1
-        return real_infer(self, *args)
 
     storage.settings().clear()
     storage.settings().setValue("dataDir", str(pathlib.Path(tmp) / name))
@@ -107,7 +104,6 @@ def app_on(clip, exercise, tmp, name, gui_delay=0.0, **patches):
                 (capture.cv2, "VideoCapture", FakeCapture),
                 (rehapose, "time", types.SimpleNamespace(perf_counter=lambda: clock[0])),
                 (rehapose.Main, "on_frame", on_frame),
-                (capture.PoseWorker, "_infer", infer),
                 *((capture, k, v) for k, v in {**defaults, **patches}.items() if k.isupper()),
                 *((rehapose, k[9:], v) for k, v in patches.items() if k.startswith("rehapose_")),
                 *(patches.get("extra", ()))):
@@ -147,10 +143,11 @@ def shut_down(window):
 def press_start_and_finish(run, seconds=60):
     QtTest.QTest.mouseClick(run.window.button, QtCore.Qt.LeftButton)
     assert pump(lambda: run.window.worker is None, seconds), "the session never ended"
-    measured = len(run.window.times["left_knee"])
     QtTest.QTest.qWait(500)  # anything still queued gets its chance to misbehave
-    assert len(run.window.times["left_knee"]) == measured, "frames recorded after the stop"
-    return sorted(run.folder.glob("*.csv"))
+    files = sorted(run.folder.glob("*.csv"))
+    saved = trace_rows(files[-1]) if files else 0
+    assert len(run.window.times["left_knee"]) == saved, "frames recorded after the stop"
+    return files
 
 
 def upper_body_records(tmp):
@@ -293,15 +290,18 @@ def main():
     CLIPS["full"] = [sample_frame()] * 240
     CLIPS["empty"] = [np.full((720, 1280, 3), 128, np.uint8)] * 45
     started = time.monotonic()
-    for scenario in SCENARIOS:
-        t = time.monotonic()
-        try:
-            scenario(tmp)
-            assert not RECORD.errors, RECORD.errors[0]
-        except BaseException:
-            save_artifacts(f"e2e-{scenario.__name__}", tmp)
-            raise
-        print(f"  ok  {scenario.__name__:26} {time.monotonic() - t:5.1f} s")
+    try:
+        for scenario in SCENARIOS:
+            t = time.monotonic()
+            try:
+                scenario(tmp)
+                assert not RECORD.errors, RECORD.errors[0]
+            except BaseException:
+                save_artifacts(f"e2e-{scenario.__name__}", tmp)
+                raise
+            print(f"  ok  {scenario.__name__:26} {time.monotonic() - t:5.1f} s")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
     peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (2**20 if sys.platform == "darwin"
                                                                  else 2**10)
     left = [w for w in QtWidgets.QApplication.topLevelWidgets() if isinstance(w, rehapose.Main)]

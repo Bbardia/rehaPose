@@ -146,6 +146,7 @@ class Main(QtWidgets.QMainWindow):
         self.clock_start = None  # starts when setup is good, not at Start
         self.setup_ok = 0
         self.frames = 0
+        self.seen = False  # any frame at all arrived this session
         self.summaries = {}
         self.viewing_stored = None
         self.model_tier = ""
@@ -500,6 +501,7 @@ class Main(QtWidgets.QMainWindow):
         self.stands, self.stand_count = [], 0
         self.counted, self.time_called, self.final_counted = None, False, False
         self.clock_start, self.setup_ok, self.frames, self.good_run = None, 0, 0, 0
+        self.seen = False
         self.summaries, self.viewing_stored = {}, None
 
     def start(self):
@@ -560,6 +562,8 @@ class Main(QtWidgets.QMainWindow):
         self._sync()
 
     def _nothing_recorded(self):
+        if not self.seen:
+            return "Stopped before the camera started - nothing recorded."
         if self.clock_start is not None:
             return "Stopped before the test started - nothing recorded."
         who = "your knees were" if self.recorded["chair"] else "you were"
@@ -629,6 +633,7 @@ class Main(QtWidgets.QMainWindow):
     def on_frame(self, frame, landmarks, dt):
         if self._stale():
             return
+        self.seen = True
         pixel, world = landmarks
         ok, hint = self.gate(pixel, world, frame)
         if not self._clock_running():

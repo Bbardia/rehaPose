@@ -49,7 +49,7 @@ def upper_body_frame():
 def sandbox(name):
     """Settings, data, dialogs, tones and slot errors all kept inside one temp folder."""
     faulthandler.enable()
-    faulthandler.dump_traceback_later(300, exit=True)  # a hang dumps stacks, not 15 silent min
+    faulthandler.dump_traceback_later(150, exit=True)  # inside the Stop hook's 180 s limit
     tmp = tempfile.mkdtemp(prefix=f"rehapose-{name.lower()}-")
     QtCore.QSettings.setDefaultFormat(QtCore.QSettings.IniFormat)
     QtCore.QSettings.setPath(QtCore.QSettings.IniFormat, QtCore.QSettings.UserScope, tmp)
@@ -335,7 +335,7 @@ def check_time_called(window, app, frame):
     window.on_frame(frame.copy(), (None, None), 7.0)   # a gap, so the rise stays last
     app.processEvents()
     assert window.worker is None, "time ran out but the session kept recording"
-    assert RECORD.tones.count("end") == 1 and RECORD.tones[-1] == "end", RECORD.tones
+    assert RECORD.tones == ["rep", "end"], RECORD.tones
     assert window.stand_count == 4 and window.final_counted, window.stand_count
     assert "more than halfway" in window.status.text(), window.status.text()
     saved = sorted(rehapose.session_dir().glob("*-chair_stand_30s.csv"))[-1]
@@ -360,16 +360,13 @@ def check_stopped_early(window):
     saved.unlink()
 
 
-class FakeWorker:
-    """Stands in for PoseWorker so stop() can be exercised without a camera."""
+class FakeWorker(QtCore.QThread):
+    """A never-started thread standing in for PoseWorker, the type _detach() really gets."""
 
     tier_log = ["heavy", "lite"]
 
     def stop(self):
         pass
-
-    def wait(self, _ms=0):
-        return True
 
 
 real_session_dir = storage.session_dir
@@ -385,6 +382,7 @@ def check_shell(window, tmp, frame, poses):
     check_still_stopping(window)
     check_save_retry(window, tmp)
     check_no_junk_session(window)
+    check_rep_cue(window)
     check_clip_end(window)
     saved, head = check_exercise_keys(window)
     stored = check_round_trip(window, saved)
@@ -508,11 +506,28 @@ def check_no_junk_session(window):
         window.worker, window.clock_start = FakeWorker(), None
         window.recorded["chair"] = chair
         window.stop()
-        assert window.worker is None
+        assert window.worker is None and not window._still_stopping()
         assert said in window.status.text(), window.status.text()
+    window.worker, window.clock_start = FakeWorker(), time.perf_counter() + 60  # mid 3-2-1
+    window.stop()
+    assert "Stopped before the test started" in window.status.text(), window.status.text()
+    window.worker, window.seen = FakeWorker(), False  # Stop before the first frame
+    window.stop()
+    assert "before the camera started" in window.status.text(), window.status.text()
+    window.seen = True
     assert set(rehapose.session_dir().glob("*.csv")) == before, "junk session written"
     window.recorded["chair"] = False
     window.times = recorded
+
+
+def check_rep_cue(window):
+    window.stands, window.stand_count = [90, 5, 90, 5, 90], 0
+    for ticked, beeps in ((False, []), (True, ["rep"])):
+        window.cue.setChecked(ticked)
+        window.stand_count = 0
+        RECORD.tones.clear()
+        window.tick_chair_stand(0.0, "")
+        assert RECORD.tones == beeps, (ticked, RECORD.tones)
 
 
 def check_clip_end(window):
