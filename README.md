@@ -236,12 +236,26 @@ why there is a setup gate and why the numbers above are what they are.
 ## Checks
 
 ```bash
-python analysis.py                                  # angle, filter, rep-span, ratchet asserts
-QT_QPA_PLATFORM=offscreen python test_rehapose.py   # real landmarks through the real UI
-ruff check .                                        # lint (config in ruff.toml)
-python mirror_check.py clip.mp4                     # mirror consistency on a real clip
-radon cc -s -a *.py                                 # complexity
+git config core.hooksPath githooks   # once per clone: the checks below run on commit and push
+
+githooks/pre-commit                  # ~10 s, every commit: lint, maths self-check, UI smoke test
+githooks/pre-push                    # ~35 s, every push: all of that, then the e2e scenarios
+python mirror_check.py clip.mp4      # mirror consistency on a real clip
+radon cc -s -a *.py                  # complexity
 ```
+
+- **`test_rehapose.py`** runs real landmarks through the real UI with a stand-in for the
+  camera thread, including the real setup check on an upper-body crop with both models.
+- **`test_e2e.py`** runs the whole app — window, camera thread, model, signals, autosave,
+  History — on clips generated from the test photo, clicking the real buttons. It covers
+  the paths a regression would most likely break: recording while seated, an empty room,
+  the full chair-stand flow, quitting mid-session, a first run offline, Stop during the
+  model download, the heavy-to-lite switch, a real video file and a missing one.
+- Both keep everything in a temporary folder and never touch your real settings or camera.
+  On failure, `REHAPOSE_ARTIFACTS=dir` saves a screenshot of the window and the sessions.
+- CI runs all of it on macOS arm64 and Ubuntu x64 and uploads those artifacts on failure.
+- **What only a real device can check** — the camera prompt, the tones you hear, a real
+  chair stand — stays a manual run before each release.
 
 ## Files
 
@@ -251,7 +265,9 @@ radon cc -s -a *.py                                 # complexity
 | `analysis.py` | Angles, filter, rep spans, setup check, exercises, norms. No Qt, no camera |
 | `storage.py` | Sessions folder, legacy migration, the session file format and its readers |
 | `capture.py` | Camera thread, tier ratchet wiring, pinned model download and hash check |
-| `test_rehapose.py` | Headless smoke test |
+| `test_rehapose.py` | Headless smoke test: real landmarks through the real UI |
+| `test_e2e.py` | End to end: the real app and camera thread on generated clips |
+| `githooks/` | `pre-commit` and `pre-push` hooks that run the checks |
 | `mirror_check.py` | Mirror-consistency measurement over a recorded clip, per model tier |
-| `.github/workflows/checks.yml` | CI: lint, self-check and smoke test on macOS arm64 and Ubuntu x64 |
+| `.github/workflows/checks.yml` | CI: all checks on macOS arm64 and Ubuntu x64, artifacts on failure |
 | `Body_Joint.py` | The original MMPose version. Kept as reference; does not run — see above |
